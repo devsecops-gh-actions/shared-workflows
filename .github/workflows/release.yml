@@ -1,0 +1,67 @@
+# release.yml
+# Plantilla de release para un repo de producto. Se copia a .github/workflows/release.yml del repo.
+# Disparo: push de tag vX.Y.Z (lo crea el bot de release, bots/release, al mergear el PR de release).
+# Orden: CI (build con publish=true) -> supply-chain (SBOM + atestacion) y publish-dry-run
+#        -> publish (registro real, environment prod con aprobacion, lo gestiona publish-package.yml).
+# Fase siguiente (no incluida): deploy-* (pipelines/deploy/). Ver README, seccion "Release".
+# Ejemplo: libreria Node.js publicada en npm. Para otro stack, cambiar CI (ci-<stack>.yml) y registry.
+# Sustituir <SHA-DEL-RELEASE> por el SHA del tag de shared-workflows (p. ej. v1.0.0).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  CI:
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-node.yml@<SHA-DEL-RELEASE> # v1.0.0
+    with:
+      kind: library
+      publish: true
+      matrix: '{"node":["22","24"]}'
+    permissions:
+      contents: read
+
+  supply-chain:
+    needs: [CI]
+    uses: <org>-platform/shared-workflows/.github/workflows/supply-chain.yml@<SHA-DEL-RELEASE> # v1.0.0
+    with:
+      artifact-name: ${{ needs.CI.outputs.artifact-name }}
+      artifact-path: ${{ needs.CI.outputs.artifact-path }}
+    # packages: write es un techo que exige el workflow llamado; solo se usa con imagen.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
+
+  publish-dry-run:
+    needs: [CI]
+    uses: <org>-platform/shared-workflows/.github/workflows/publish-package.yml@<SHA-DEL-RELEASE> # v1.0.0
+    with:
+      registry: npm
+      version: ${{ needs.CI.outputs.version }}
+      artifact-name: ${{ needs.CI.outputs.artifact-name }}
+      artifact-path: ${{ needs.CI.outputs.artifact-path }}
+      dry-run: true
+    permissions:
+      contents: read
+
+  publish:
+    needs: [CI, supply-chain, publish-dry-run]
+    uses: <org>-platform/shared-workflows/.github/workflows/publish-package.yml@<SHA-DEL-RELEASE> # v1.0.0
+    with:
+      registry: npm
+      version: ${{ needs.CI.outputs.version }}
+      artifact-name: ${{ needs.CI.outputs.artifact-name }}
+      artifact-path: ${{ needs.CI.outputs.artifact-path }}
+      dry-run: false
+    # El job publish de publish-package.yml usa environment prod (aprobacion humana) y OIDC para npm.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
