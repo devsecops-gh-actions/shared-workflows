@@ -1,0 +1,389 @@
+# devsecops-deps: workflow reutilizable del bot de dependencias (PLAN.md 2.8 y WS5).
+#
+# Lo invoca un caller del repo de producto cuando el PR lo abre dependabot[bot] (ver README.md).
+# Jobs:
+#   guard     Solo lectura. Comprueba que el PR es de Dependabot, del mismo repo, no está
+#             contaminado y clasifica la actualización con scripts/classify-update.mjs.
+#   build-*   Ejecuta ci-<stack>.yml (WS2). Un job por stack porque el uses: de un reutilizable
+#             debe ser literal. Solo corre si el PR no está contaminado.
+#   decide    Usa el token de la App devsecops-deps. Etiqueta deps:<tipo>, publica un comentario
+#             con marcador <!-- devsecops-deps --> y, solo si todo se cumple, activa auto-merge
+#             con squash fijado al SHA evaluado. Nunca aprueba ni salta revisiones requeridas.
+#
+# Referencia a ci-<stack>.yml (jobs build-*): GitHub no admite expresiones en uses:, así que no hay
+# input "shared-workflow-ref". Antes de activar, sustituir en los seis jobs build-* las dos partes
+# marcadas: <org>-platform/shared-workflows (repo) y <sha-completo> (SHA del commit de ese repo).
+# Ver la tabla de prerrequisitos en README.md.
+#
+# Seguridad: el código del PR no se descarga ni se ejecuta en ningún job. La metadata y la lista
+# de ficheros vienen de la API. Los jobs de build usan el GITHUB_TOKEN de solo lectura del PR de
+# Dependabot; la escritura solo ocurre en decide, con el token de la App.
+
+name: Deps
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: "Número del PR de Dependabot (github.event.pull_request.number del caller)"
+        type: string
+        required: true
+      stack:
+        description: "node | java | dotnet | python | go | docker (custom property stack del repo)"
+        type: string
+        required: true
+      kind:
+        description: "application | library | data | lowcode | infra. Se pasa a ci-<stack>.yml; publish siempre false."
+        type: string
+        required: false
+        default: application
+      working-directory:
+        description: "Subcarpeta del proyecto (monorepos)"
+        type: string
+        required: false
+        default: "."
+      matrix:
+        description: "Matriz JSON de runtimes/SO para ci-<stack>.yml"
+        type: string
+        required: false
+        default: "{}"
+      automerge:
+        description: "Opt-in por repo. Solo con true se activa auto-merge en patch y minor."
+        type: boolean
+        required: false
+        default: false
+      app-id:
+        description: "ID numérico de la App devsecops-deps (variable DEVSECOPS_DEPS_APP_ID del caller)"
+        type: string
+        required: false
+      tool-repository:
+        description: "Repo que contiene bots/deps (p. ej. <org>-platform/devsecops-github-enterprise)"
+        type: string
+        required: true
+      tool-ref:
+        description: "SHA completo (40 caracteres) del commit del repo de herramientas"
+        type: string
+        required: true
+      tool-path:
+        description: "Ruta de bots/deps dentro del repo de herramientas"
+        type: string
+        required: false
+        default: bots/deps
+    secrets:
+      app-private-key:
+        description: "Clave privada de la App (SEC_DEVSECOPS_DEPS_PRIVATE_KEY). Debe existir también en Dependabot secrets."
+        required: false
+
+# Sin permisos por defecto. Cada job declara lo que necesita.
+permissions: {}
+
+# Una sola ejecución a la vez por PR; no se cancela una decisión en curso.
+concurrency:
+  group: devsecops-deps-${{ inputs.pr-number }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      dependabot: ${{ steps.check.outputs.dependabot }}
+      build: ${{ steps.check.outputs.build }}
+      type: ${{ steps.check.outputs.type }}
+      automerge: ${{ steps.check.outputs.automerge }}
+      head-sha: ${{ steps.check.outputs.head-sha }}
+      ecosystem: ${{ steps.check.outputs.ecosystem }}
+      reasons-b64: ${{ steps.check.outputs.reasons-b64 }}
+    steps:
+      - name: Descargar herramienta fijada por SHA (no se descarga el código del PR)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.tool-repository }}
+          ref: ${{ inputs.tool-ref }}
+          path: .devsecops-deps-tool
+          persist-credentials: false
+
+      - name: Comprobar PR, contaminación y clasificar la actualización
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+          STACK: ${{ inputs.stack }}
+          TOOL_REF: ${{ inputs.tool-ref }}
+          TOOL_PATH: ${{ inputs.tool-path }}
+        run: |
+          set -euo pipefail
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+          [[ "$TOOL_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::tool-ref debe ser un SHA completo de 40 caracteres"; exit 1; }
+          [[ "$TOOL_PATH" =~ ^[A-Za-z0-9_./-]+$ && "$TOOL_PATH" != *..* ]] || { echo "::error::tool-path no válido"; exit 1; }
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::pr-number no válido"; exit 1; }
+          case "$STACK" in node|java|dotnet|python|go|docker) ;; *) echo "::error::stack no soportado: $STACK"; exit 1 ;; esac
+
+          RAW="$RUNNER_TEMP/pr-raw.json"
+          gh api "repos/$REPO/pulls/$PR" > "$RAW"
+          AUTHOR=$(jq -r '.user.login' "$RAW")
+          STATE=$(jq -r '.state' "$RAW")
+          HEAD_REPO=$(jq -r '.head.repo.full_name // ""' "$RAW")
+          HEAD_REF=$(jq -r '.head.ref' "$RAW")
+          HEAD_SHA=$(jq -r '.head.sha' "$RAW")
+          ECO=$(jq -r '[.labels[].name | select(startswith("ecosystem:")) | sub("^ecosystem:"; "")] | .[0] // ""' "$RAW")
+          SKIP=$(jq -r '[.labels[].name] | any(. == "bot:skip-deps")' "$RAW")
+          out head-sha "$HEAD_SHA"
+          out ecosystem "$ECO"
+
+          DEPENDABOT=false
+          if [[ "$AUTHOR" == "dependabot[bot]" && "$STATE" == "open" && "$HEAD_REPO" == "$REPO" && "$HEAD_REF" == dependabot/* && "$SKIP" != "true" ]]; then
+            DEPENDABOT=true
+          fi
+          out dependabot "$DEPENDABOT"
+          if [[ "$DEPENDABOT" != "true" ]]; then
+            echo "::notice::El PR no es de Dependabot en el mismo repo, está cerrado o tiene bot:skip-deps: no se procesa."
+            out build false; out type ""; out automerge false; out reasons-b64 ""
+            exit 0
+          fi
+
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/files.txt"
+          jq --arg eco "$ECO" --rawfile files "$RUNNER_TEMP/files.txt" \
+            '{title: (.title // ""), body: (.body // ""), ecosystem: $eco, files: ($files | split("\n") | map(select(length > 0)))}' \
+            "$RAW" > "$RUNNER_TEMP/meta.json"
+
+          RESULT=$(node ".devsecops-deps-tool/$TOOL_PATH/scripts/classify-update.mjs" --input "$RUNNER_TEMP/meta.json")
+          TYPE=$(jq -r '.type' <<< "$RESULT")
+          AUTO=$(jq -r '.automerge' <<< "$RESULT")
+          NCONTAM=$(jq -r '.contaminated | length' <<< "$RESULT")
+          REASONS=$(jq -r '.reasons[]' <<< "$RESULT" || true)
+          NFILES=$(grep -c . "$RUNNER_TEMP/files.txt" || true)
+
+          # Excepciones activas: cualquier entrada "id:" en security/exceptions.yml del repo bloquea el auto-merge.
+          # Un error distinto de 404 al leer el fichero se trata como fallo (fail-closed).
+          if EXC_RAW=$(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/security/exceptions.yml" 2>"$RUNNER_TEMP/exc.err"); then
+            if grep -Eq '^[[:space:]]*(-[[:space:]]*)?id:' <<< "$EXC_RAW"; then
+              AUTO=false
+              REASONS="${REASONS}"$'\n'"security/exceptions.yml tiene excepciones: no se activa auto-merge"
+            fi
+          elif grep -q "HTTP 404" "$RUNNER_TEMP/exc.err"; then
+            :
+          else
+            echo "::error::No se pudo leer security/exceptions.yml"; cat "$RUNNER_TEMP/exc.err"; exit 1
+          fi
+
+          BUILD=false
+          if [[ "$NCONTAM" == "0" && "$NFILES" -gt 0 && -n "$ECO" ]]; then BUILD=true; fi
+
+          out build "$BUILD"
+          out type "$TYPE"
+          out automerge "$AUTO"
+          out reasons-b64 "$(printf '%s' "$REASONS" | base64 -w0)"
+          echo "Tipo: $TYPE | contaminación: $NCONTAM | build: $BUILD | auto-merge candidato: $AUTO"
+
+  # Un job por stack: el uses: de un reutilizable no admite expresiones.
+  # Los nombres de check (build-<stack> / build-and-test) se confirman en el piloto (PLAN 2.1).
+  build-node:
+    name: build-node
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'node'
+    permissions:
+      contents: read
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-node.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+      publish: false
+
+  build-java:
+    name: build-java
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'java'
+    permissions:
+      contents: read
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-java.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+      publish: false
+
+  build-dotnet:
+    name: build-dotnet
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'dotnet'
+    permissions:
+      contents: read
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-dotnet.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+      publish: false
+
+  build-python:
+    name: build-python
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'python'
+    permissions:
+      contents: read
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-python.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+      publish: false
+
+  build-go:
+    name: build-go
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'go'
+    permissions:
+      contents: read
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-go.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+      publish: false
+
+  build-docker:
+    name: build-docker
+    needs: guard
+    if: needs.guard.outputs.build == 'true' && inputs.stack == 'docker'
+    permissions:
+      contents: read
+      packages: write   # exigido por ci-docker.yml; el caller debe conceder también packages: write
+    uses: <org>-platform/shared-workflows/.github/workflows/ci-docker.yml@<sha-completo>
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      kind: ${{ inputs.kind }}
+      matrix: ${{ inputs.matrix }}
+
+  decide:
+    name: decide
+    needs: [guard, build-node, build-java, build-dotnet, build-python, build-go, build-docker]
+    if: always() && needs.guard.result == 'success' && needs.guard.outputs.dependabot == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Token de vida corta de la App devsecops-deps
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # contents: write solo para activar auto-merge (gh pr merge --auto). El bot no aprueba ni hace push.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Decidir, etiquetar, comentar y activar auto-merge si procede
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+          TYPE: ${{ needs.guard.outputs.type }}
+          AUTO_CANDIDATE: ${{ needs.guard.outputs.automerge }}
+          HEAD_SHA: ${{ needs.guard.outputs.head-sha }}
+          REASONS_B64: ${{ needs.guard.outputs.reasons-b64 }}
+          INPUT_AUTOMERGE: ${{ inputs.automerge }}
+          R_NODE: ${{ needs.build-node.result }}
+          R_JAVA: ${{ needs.build-java.result }}
+          R_DOTNET: ${{ needs.build-dotnet.result }}
+          R_PYTHON: ${{ needs.build-python.result }}
+          R_GO: ${{ needs.build-go.result }}
+          R_DOCKER: ${{ needs.build-docker.result }}
+        run: |
+          set -euo pipefail
+
+          # Builds: todos los ejecutados deben ser success; al menos uno debe haberse ejecutado.
+          ran=0; builds_ok=true
+          for r in "$R_NODE" "$R_JAVA" "$R_DOTNET" "$R_PYTHON" "$R_GO" "$R_DOCKER"; do
+            case "$r" in
+              success) ran=$((ran + 1)) ;;
+              skipped) ;;
+              *) builds_ok=false ;;
+            esac
+          done
+          [[ "$ran" -gt 0 ]] || builds_ok=false
+
+          case "$TYPE" in patch|minor|major|security) ;; *) echo "::error::tipo desconocido: $TYPE"; exit 1 ;; esac
+
+          MERGE=false
+          if [[ "$INPUT_AUTOMERGE" == "true" && "$AUTO_CANDIDATE" == "true" && "$builds_ok" == "true" && ( "$TYPE" == "patch" || "$TYPE" == "minor" ) ]]; then
+            MERGE=true
+          fi
+
+          if [[ "$INPUT_AUTOMERGE" != "true" ]]; then
+            MOTIVO="el repo no tiene activado el auto-merge del bot (input \`automerge\`)."
+          elif [[ "$TYPE" != "patch" && "$TYPE" != "minor" ]]; then
+            MOTIVO="la actualización es \`$TYPE\`: requiere revisión humana."
+          elif [[ "$builds_ok" != "true" ]]; then
+            MOTIVO="algún build no pasó o no se ejecutó."
+          elif [[ "$AUTO_CANDIDATE" != "true" ]]; then
+            MOTIVO="contaminación del PR o excepciones activas (ver motivos)."
+          else
+            MOTIVO=""
+          fi
+
+          # Etiqueta de tipo: se quita la de los otros tipos.
+          LABEL="deps:$TYPE"
+          gh label create "$LABEL" --repo "$REPO" --color "BFD4F2" --description "devsecops-deps: tipo de actualización" --force >/dev/null 2>&1 || true
+          for l in deps:patch deps:minor deps:major deps:security; do
+            if [[ "$l" != "$LABEL" ]]; then
+              gh pr edit "$PR" --repo "$REPO" --remove-label "$l" >/dev/null 2>&1 || true
+            fi
+          done
+          gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL"
+
+          # Comentario único, actualizable, con marcador.
+          REASONS=$(base64 -d <<< "$REASONS_B64" || true)
+          BODY="$RUNNER_TEMP/deps-comment.md"
+          {
+            echo "<!-- devsecops-deps -->"
+            echo "### devsecops-deps: actualización \`$TYPE\`"
+            echo ""
+            echo "| Stack | Resultado del build |"
+            echo "|---|---|"
+            echo "| node | ${R_NODE} |"
+            echo "| java | ${R_JAVA} |"
+            echo "| dotnet | ${R_DOTNET} |"
+            echo "| python | ${R_PYTHON} |"
+            echo "| go | ${R_GO} |"
+            echo "| docker | ${R_DOCKER} |"
+            echo ""
+            if [[ "$MERGE" == "true" ]]; then
+              echo "Auto-merge solicitado (squash) para \`$HEAD_SHA\`. Sigue sujeto a las revisiones requeridas del ruleset: el bot no aprueba."
+            else
+              echo "Auto-merge no activado: $MOTIVO"
+            fi
+            if [[ -n "$REASONS" ]]; then
+              echo ""
+              echo "Motivos:"
+              while IFS= read -r line; do [[ -n "$line" ]] && echo "- $line"; done <<< "$REASONS"
+            fi
+          } > "$BODY"
+          cat "$BODY" >> "$GITHUB_STEP_SUMMARY"
+
+          ID=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.body | contains("<!-- devsecops-deps -->")) | .id' | sed -n '1p')
+          if [[ -n "$ID" ]]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$ID" -F body=@"$BODY" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$BODY" >/dev/null
+          fi
+
+          # Auto-merge con squash fijado al SHA evaluado: si llega un push nuevo, la activación falla.
+          if [[ "$MERGE" == "true" ]]; then
+            if gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA"; then
+              echo "Auto-merge activado (squash) para $HEAD_SHA."
+            else
+              echo "::warning::No se pudo activar auto-merge. Comprueba que el repo lo permite."
+            fi
+          fi

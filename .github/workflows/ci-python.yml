@@ -1,0 +1,337 @@
+# ci-python.yml
+# Workflow reutilizable: tests (pytest + cobertura coverage.xml) y build de paquetes Python
+# con pip, poetry o uv (autodetectado por lockfile).
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI Python
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Subcarpeta del proyecto (monorepos). Relativa a la raiz del repo.
+        type: string
+        default: '.'
+      matrix:
+        description: 'JSON con combinaciones de runtime. Clave `python`. Ej.: {"python":["3.11","3.13"]}. Se fusiona con el valor por defecto.'
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` o `library`. Ambos generan .whl y .tar.gz (sdist).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar pytest con cobertura (coverage.xml) en la matriz.
+        type: boolean
+        default: true
+      publish:
+        description: Solo `library`. Valida tag vX.Y.Z frente a la version de pyproject.toml. No publica; la publicacion es de publish-package.yml (PyPI trusted publishing).
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+      package-manager:
+        description: '`auto` (uv.lock -> uv; poetry.lock -> poetry; si no -> pip), `pip`, `poetry` o `uv`.'
+        type: string
+        default: auto
+    outputs:
+      version:
+        description: Version semver (2.4).
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido.
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta del .whl (artefacto principal) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+      package-id:
+        description: Solo library. `name@version`.
+        value: ${{ jobs.build-and-test.outputs.package-id }}
+
+permissions:
+  contents: read
+
+env:
+  # Herramientas instaladas con versión fijada. Verificar que existen en el índice antes del piloto.
+  BUILD_VERSION: '1.2.2'
+  POETRY_VERSION: '2.1.3'
+  UV_VERSION: '0.7.21'
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      primary: ${{ steps.matrix.outputs.primary }}
+    steps:
+      - name: Fusionar matriz con valores por defecto
+        id: matrix
+        env:
+          INPUT_MATRIX: ${{ inputs.matrix || '{}' }}
+        run: |
+          set -euo pipefail
+          defaults='{"python":["3.11"]}'
+          m=$(jq -cn --argjson d "$defaults" --argjson i "$INPUT_MATRIX" '$d * $i')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "primary=$(jq -r '.python[0]' <<< "$m")" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    if: ${{ inputs.run-tests }}
+    runs-on: ${{ matrix.os || fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar gestor y lockfile
+        id: pm
+        env:
+          WD: ${{ inputs.working-directory }}
+          PM_INPUT: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          pm="$PM_INPUT"
+          if [ "$pm" = "auto" ]; then
+            if [ -f "$WD/uv.lock" ]; then pm=uv
+            elif [ -f "$WD/poetry.lock" ]; then pm=poetry
+            else pm=pip; fi
+          fi
+          case "$pm" in
+            pip)    ls "$WD"/requirements*.txt >/dev/null 2>&1 || { echo "::error::pip requiere requirements*.txt (con hashes)."; exit 1; }
+                    echo "lockfile=$WD/requirements*.txt" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=pip" >> "$GITHUB_OUTPUT" ;;
+            poetry) [ -f "$WD/poetry.lock" ] || { echo "::error::Falta poetry.lock."; exit 1; }
+                    echo "lockfile=$WD/poetry.lock" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=poetry" >> "$GITHUB_OUTPUT" ;;
+            uv)     [ -f "$WD/uv.lock" ] || { echo "::error::Falta uv.lock."; exit 1; }
+                    echo "lockfile=$WD/uv.lock" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::package-manager no soportado: $pm"; exit 1 ;;
+          esac
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar Python y cache
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: ${{ steps.pm.outputs.setup-cache }}
+          cache-dependency-path: ${{ steps.pm.outputs.lockfile }}
+
+      - name: Cache de uv (clave por uv.lock)
+        if: ${{ steps.pm.outputs.pm == 'uv' }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ matrix.python }}-${{ hashFiles('**/uv.lock') }}
+
+      - name: Instalar herramienta y dependencias
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pip)
+              python -m pip install --upgrade pip
+              reqs=$(ls requirements*.txt | head -n1)
+              hashmode=""
+              grep -q -- '--hash=' requirements*.txt && hashmode="--require-hashes"
+              for r in requirements*.txt; do python -m pip install $hashmode -r "$r"; done
+              if [ -f pyproject.toml ]; then python -m pip install -e .; fi ;;
+            poetry)
+              python -m pip install "poetry==$POETRY_VERSION"
+              poetry check --lock
+              poetry install --no-interaction ;;
+            uv)
+              python -m pip install "uv==$UV_VERSION"
+              uv sync --frozen ;;
+          esac
+
+      - name: Tests con cobertura
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pip)    python -m pytest --cov --cov-report=xml ;;
+            poetry) poetry run pytest --cov --cov-report=xml ;;
+            uv)     uv run pytest --cov --cov-report=xml ;;
+          esac
+
+      - name: Subir cobertura (coverage.xml)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-python-${{ matrix.python }}
+          path: ${{ inputs.working-directory }}/coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-and-test:
+    name: build-and-test
+    needs: [prepare, test]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      artifact-path: ${{ steps.pkg.outputs.artifact-path }}
+      package-id: ${{ steps.pkg.outputs.package-id }}
+    steps:
+      - name: Comprobar resultado de tests
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$TEST_RESULT" != "success" ] && [ "$TEST_RESULT" != "skipped" ]; then
+            echo "::error::El job test ha terminado con '$TEST_RESULT'."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar gestor y lockfile
+        id: pm
+        env:
+          WD: ${{ inputs.working-directory }}
+          PM_INPUT: ${{ inputs.package-manager }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          pm="$PM_INPUT"
+          if [ "$pm" = "auto" ]; then
+            if [ -f "$WD/uv.lock" ]; then pm=uv
+            elif [ -f "$WD/poetry.lock" ]; then pm=poetry
+            else pm=pip; fi
+          fi
+          case "$pm" in
+            pip)    ls "$WD"/requirements*.txt >/dev/null 2>&1 || { echo "::error::pip requiere requirements*.txt (con hashes)."; exit 1; }
+                    echo "lockfile=$WD/requirements*.txt" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=pip" >> "$GITHUB_OUTPUT" ;;
+            poetry) [ -f "$WD/poetry.lock" ] || { echo "::error::Falta poetry.lock."; exit 1; }
+                    echo "lockfile=$WD/poetry.lock" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=poetry" >> "$GITHUB_OUTPUT" ;;
+            uv)     [ -f "$WD/uv.lock" ] || { echo "::error::Falta uv.lock."; exit 1; }
+                    echo "lockfile=$WD/uv.lock" >> "$GITHUB_OUTPUT"
+                    echo "setup-cache=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::package-manager no soportado: $pm"; exit 1 ;;
+          esac
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar Python (runtime principal) y cache
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ needs.prepare.outputs.primary }}
+          cache: ${{ steps.pm.outputs.setup-cache }}
+          cache-dependency-path: ${{ steps.pm.outputs.lockfile }}
+
+      - name: Instalar herramienta y dependencias
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pip)
+              python -m pip install --upgrade pip
+              hashmode=""
+              grep -q -- '--hash=' requirements*.txt && hashmode="--require-hashes"
+              for r in requirements*.txt; do python -m pip install $hashmode -r "$r"; done
+              python -m pip install "build==$BUILD_VERSION"
+              if [ -f pyproject.toml ]; then python -m pip install -e .; fi ;;
+            poetry)
+              python -m pip install "poetry==$POETRY_VERSION"
+              poetry install --no-interaction ;;
+            uv)
+              python -m pip install "uv==$UV_VERSION"
+              uv sync --frozen ;;
+          esac
+
+      - name: Calcular version y nombre de artefacto
+        id: meta
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          base=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*"([^"]+)".*/\1/' || true)
+          base="${base%%[-+]*}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base:-0.0.0}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            [ "$KIND" = "library" ] || { echo "::error::publish=true solo aplica a kind=library."; exit 1; }
+            [[ "$GITHUB_REF" == refs/tags/v* ]] || { echo "::error::publish=true requiere un tag v*."; exit 1; }
+            [ "$version" = "$base" ] || { echo "::error::El tag ($version) no coincide con version de pyproject.toml ($base)."; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build (sdist y wheel)
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            pip)    python -m build --sdist --wheel --outdir dist . ;;
+            poetry) poetry build ;;
+            uv)     uv build ;;
+          esac
+
+      - name: Empaquetar
+        id: pkg
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$out"
+          shopt -s nullglob
+          whls=( dist/*.whl ); sdists=( dist/*.tar.gz )
+          [ "${#whls[@]}" -gt 0 ] && [ "${#sdists[@]}" -gt 0 ] || { echo "::error::El build no ha generado .whl y .tar.gz."; exit 1; }
+          cp "${whls[@]}" "${sdists[@]}" "$out/"
+          echo "artifact-path=artifacts/$(basename "${whls[0]}")" >> "$GITHUB_OUTPUT"
+          if [ "$KIND" = "library" ]; then
+            name=$(grep -m1 -E '^name[[:space:]]*=' pyproject.toml | sed -E 's/^[^=]*=[[:space:]]*"([^"]+)".*/\1/')
+            echo "package-id=$name@$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "package-id=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

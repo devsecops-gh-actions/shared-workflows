@@ -1,0 +1,256 @@
+# Workflow reutilizable de seguridad de código (WS3).
+# Checks que produce (contrato PLAN.md 2.1):
+#   Security / codeql               (solo si se pasa codeql-languages; ver abajo)
+#   Security / dependency-review    (todos los stacks, solo en pull_request)
+#   Security / secret-scan          (todos los stacks)
+#
+# Uso: ver security/examples/caller-security.yml.
+#
+# Nombres de check: si se invoca como reutilizable, GitHub puede mostrar
+# "<job del caller> / <job del workflow>". Pendiente de confirmar en el piloto (PLAN.md 2.1).
+#
+# codeql condicionado: si codeql-languages está vacío, el job se omite. Un check omitido
+# cuenta como correcto en un ruleset, así que un caller que omita la entrada desactiva
+# CodeQL sin aviso. El caller debe pasar la lista de lenguajes siempre que el repo tenga código analizable.
+#
+# Permisos: el bloque de nivel superior es el mínimo; cada job declara los suyos.
+# Acciones de terceros fijadas por SHA con comentario de versión.
+
+name: Security
+
+on:
+  workflow_call:
+    inputs:
+      codeql-languages:
+        description: 'Lenguajes de CodeQL separados por coma (p. ej. "javascript-typescript,python"). Vacío = job codeql omitido.'
+        type: string
+        required: false
+        default: ''
+      codeql-build-command:
+        description: 'Comando de build para lenguajes compilados (Java, C#, C/C++). Vacío = autobuild.'
+        type: string
+        required: false
+        default: ''
+      dependency-fail-on-severity:
+        description: 'Severidad mínima de dependencias que bloquea el PR (low, moderate, high, critical). Contrato: policy.yml fail_on.dependencies = high.'
+        type: string
+        required: false
+        default: 'high'
+      deny-licenses:
+        description: 'Licencias prohibidas, separadas por coma (SPDX). Vacío = sin restricción hasta que governance lo defina.'
+        type: string
+        required: false
+        default: ''
+      security-config-repository:
+        description: 'Repo que contiene security/exceptions.yml y security/scripts/gen-ignores.mjs, p. ej. <org>-platform/security-config. Vacío = sin excepciones (fail-closed).'
+        type: string
+        required: false
+        default: ''
+      security-config-ref:
+        description: 'Ref de security-config a usar (SHA o tag).'
+        type: string
+        required: false
+        default: 'main'
+      app-token:
+        description: 'Token de instalación de la App devsecops-security-reviewer con administration: read, generado por el caller con actions/create-github-app-token. Solo se usa si require-push-protection es true. Se pasa como input, no como secreto.'
+        type: string
+        required: false
+        default: ''
+      require-push-protection:
+        description: 'Si true, secret-scan falla si la protección de push no está activa. Requiere app-token (ver README).'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    if: inputs.codeql-languages != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write   # subir SARIF a Code scanning
+      actions: read            # necesario en repos privados para CodeQL
+      packages: read           # descargar paquetes privados durante el build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        env:
+          CODEQL_LANGUAGES: ${{ inputs.codeql-languages }}
+          CODEQL_BUILD_MODE: ${{ inputs.codeql-build-command != '' && 'manual' || 'autobuild' }}
+        with:
+          languages: ${{ env.CODEQL_LANGUAGES }}
+          queries: security-extended
+          build-mode: ${{ env.CODEQL_BUILD_MODE }}
+
+      - name: Autobuild
+        if: inputs.codeql-build-command == ''
+        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+
+      - name: Build manual
+        if: inputs.codeql-build-command != ''
+        env:
+          BUILD_CMD: ${{ inputs.codeql-build-command }}
+        run: bash -c "$BUILD_CMD"
+
+      - name: Analizar y subir SARIF
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          output: ${{ runner.temp }}/codeql-results
+          upload: true
+
+      - name: Aplicar umbral codeql (solo severidad error)
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/codeql-results
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=("${RESULTS_DIR}"/*.sarif)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No se generó SARIF de CodeQL"; exit 1
+          fi
+          count=0
+          for f in "${files[@]}"; do
+            n="$(jq '[.runs[].results[]? | select(.level == "error")] | length' "$f")"
+            count=$((count + n))
+          done
+          echo "Hallazgos CodeQL de severidad error: ${count}"
+          if [ "${count}" -gt 0 ]; then
+            echo "::error::CodeQL encontró ${count} hallazgo(s) de severidad error (policy.yml codeql: error)."
+            exit 1
+          fi
+
+      - name: Guardar SARIF como artefacto
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-sarif
+          path: ${{ runner.temp }}/codeql-results
+          if-no-files-found: warn
+          retention-days: 30
+
+  dependency-review:
+    # Todos los stacks. Solo corre en pull_request; en otros eventos el check queda "skipped".
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Revisar dependencias del PR
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: ${{ inputs.dependency-fail-on-severity }}
+          deny-licenses: ${{ inputs.deny-licenses }}
+          comment-summary-in-pr: never
+
+  secret-scan:
+    # Todos los stacks.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: '8.30.1'
+      # SHA-256 oficial de gitleaks_8.30.1_linux_x64.tar.gz (fichero de checksums de la release).
+      GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+    steps:
+      - name: Checkout con historial
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout de security-config (exceptions.yml y generador)
+        if: inputs.security-config-repository != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.security-config-repository }}
+          ref: ${{ inputs.security-config-ref }}
+          path: security-config
+          persist-credentials: false
+
+      - name: Generar ignorados por repositorio desde exceptions.yml
+        if: inputs.security-config-repository != ''
+        env:
+          SCOPE: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node security-config/security/scripts/gen-ignores.mjs "${RUNNER_TEMP}/ignores" \
+            --input security-config/security/exceptions.yml --scope "${SCOPE}"
+
+      - name: Sin configuración de excepciones (fail-closed, sin ignorados)
+        if: inputs.security-config-repository == ''
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ignores"
+          echo "::warning::security-config-repository vacío: no se aplica ninguna excepción."
+          : > "${RUNNER_TEMP}/ignores/.gitleaksignore"
+          : > "${RUNNER_TEMP}/ignores/.trivyignore"
+
+      - name: Verificar push protection
+        if: inputs.require-push-protection
+        env:
+          GH_TOKEN: ${{ inputs.app-token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::require-push-protection=true pero app-token está vacío. El caller debe generarlo con create-github-app-token (ver security/examples/caller-security.yml)."
+            exit 1
+          fi
+          status="$(gh api "repos/${REPO}" --jq '.security_and_analysis.secret_scanning_push_protection.status // "unknown"')"
+          echo "Estado de push protection: ${status}"
+          if [ "${status}" != "enabled" ]; then
+            echo "::error::Push protection no está activo (estado: ${status}). Actívalo desde la configuración de code security de la enterprise (WS1)."
+            exit 1
+          fi
+
+      - name: Instalar gitleaks (versión y checksum fijados)
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/gitleaks.tar.gz" "${GITLEAKS_URL}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/gitleaks.tar.gz" -C "${RUNNER_TEMP}" gitleaks
+          "${RUNNER_TEMP}/gitleaks" version
+
+      - name: Escanear secretos
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          args=(git --redact --exit-code 1 --verbose --source . \
+                --gitleaks-ignore-path "${RUNNER_TEMP}/ignores/.gitleaksignore" \
+                --report-format sarif --report-path "${RUNNER_TEMP}/gitleaks.sarif")
+          range=""
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+            range="${BEFORE_SHA}..${CURRENT_SHA}"
+          fi
+          if [ -n "${range}" ]; then
+            args+=(--log-opts="${range}")
+          fi
+          "${RUNNER_TEMP}/gitleaks" "${args[@]}"
+
+      - name: Guardar informe SARIF
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-sarif
+          path: ${{ runner.temp }}/gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 30

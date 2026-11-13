@@ -1,0 +1,386 @@
+# Workflow reutilizable: Sisnet (objetos/paquetes de la API Studio) para low-code.
+# Equivalente a Pipeline_Sisnet / Sisnet_{develop,feature,release,hotfix}.groovy y sisnet_calls.groovy
+# de la librería Jenkins (checks, backup, deploy, rollback por API).
+# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/sisnet.yml
+# Ver README.md de esta carpeta.
+#
+# Entornos: NO son fijos. El caller pasa environment-chain: lista JSON ordenada de objetos
+#   {"env": "<entorno GitHub>", "subenvs": "<subentornos Studio separados por comas>"}.
+#   - develop y feature: solo se usa el primer elemento.
+#   - release y hotfix: se despliega la cadena completa (mínimo 2). El penúltimo ejecuta las pruebas
+#     funcionales; el último exige aprobación (required reviewers en GitHub). Solo el último tiene aprobación.
+#   - hotfix-environment-chain (opcional): cadena propia para hotfix. Vacío = environment-chain.
+# Cada entorno define: var SISNET_STORE_HOST; secrets SEC_SISNET_STORE_USER y SEC_SISNET_STORE_PASSWORD
+# (Basic auth de la API Studio: no hay OIDC disponible, excepción justificada en el README).
+
+name: lowcode-sisnet
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "deploy: instala la versión de version_orchestra.json. rollback: restaura el backup de rollback-run-id."
+        type: string
+        default: "deploy"
+      orchestra-file:
+        description: "Fichero de orquestación del repo (version, version_to_deploy.store)."
+        type: string
+        default: "version_orchestra.json"
+      environment-chain:
+        description: 'Lista JSON ordenada de {"env","subenvs"}. Ejemplo: [{"env":"<entorno-1>","subenvs":"<A,B>"},{"env":"<entorno-2>","subenvs":"<C>"}].'
+        type: string
+        required: true
+      hotfix-environment-chain:
+        description: "Cadena propia para hotfix (mismo formato). Vacío = usar environment-chain."
+        type: string
+        default: ""
+      rollback-run-id:
+        description: "Solo mode=rollback: id de la ejecución cuyos artefactos sisnet-backup-<env> se restauran."
+        type: string
+        default: ""
+      functional-test-command:
+        description: "Pruebas funcionales en el penúltimo entorno. Obligatorio en release y hotfix (fail-closed)."
+        type: string
+        default: ""
+      runner-labels:
+        description: "Etiquetas JSON del runner para entornos sin aprobación. Los hosts Studio son de red interna: self-hosted."
+        type: string
+        default: '["self-hosted","linux","x64"]'
+      runner-approval-labels:
+        description: "Etiquetas JSON del runner para el último entorno (con aprobación)."
+        type: string
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lowcode-sisnet-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Checks (equivale a sisnet_calls.checks y a la validación de version_orchestra.json)
+  # ---------------------------------------------------------------------------
+  checks:
+    name: Checks de orquestación y entornos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      rollback-targets: ${{ steps.targets.outputs.rollback-targets }}
+    env:
+      ORCH: ${{ inputs.orchestra-file }}
+      REF_NAME: ${{ github.ref_name }}
+      CHAIN: ${{ inputs.environment-chain }}
+      HOTFIX_CHAIN: ${{ inputs.hotfix-environment-chain }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Validar version_orchestra.json
+        run: |
+          set -euo pipefail
+          case "$REF_NAME" in
+            develop|feature/*) TYPE=dev ;;
+            release/*)         TYPE=release ;;
+            hotfix/*)          TYPE=hotfix ;;
+            *) echo "::error::La rama $REF_NAME no tiene pipeline Sisnet (develop, feature/*, release/*, hotfix/*)"; exit 1 ;;
+          esac
+          test -f "$ORCH" || { echo "::error::No existe $ORCH"; exit 1; }
+
+          VERSION=$(jq -r '.version // empty' "$ORCH")
+          if [ "$TYPE" = dev ]; then RE='^[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT$'; else RE='^[0-9]+\.[0-9]+\.[0-9]+$'; fi
+          if ! [[ "$VERSION" =~ $RE ]]; then
+            echo "::error::version '$VERSION' no válida para $REF_NAME (dev: NUM.NUM.NUM-SNAPSHOT; release/hotfix: NUM.NUM.NUM)"; exit 1
+          fi
+
+          jq -e '.version_to_deploy.store | type == "array" and length > 0' "$ORCH" >/dev/null \
+            || { echo "::error::version_to_deploy.store debe ser un array no vacío"; exit 1; }
+          # Cada entrada: exactamente una de label o package
+          jq -e '.version_to_deploy.store | all( ((has("label") and has("package")) | not) and (has("label") or has("package")) )' "$ORCH" >/dev/null \
+            || { echo "::error::Cada entrada de store debe tener solo 'label' o solo 'package'"; exit 1; }
+          # Entradas package: lista de {nombrePaquete, versionPaquete} no vacíos
+          jq -e '[.version_to_deploy.store[] | select(has("package")) | .package] | all(length > 0 and all(.[]; (.nombrePaquete // "" | length) > 0 and (.versionPaquete // "" | length) > 0))' "$ORCH" >/dev/null \
+            || { echo "::error::Entradas package incompletas (nombrePaquete/versionPaquete)"; exit 1; }
+          echo "version $VERSION válida para $REF_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Calcular entornos por rama (cadena, aprobación y pre-aprobación)
+        id: targets
+        run: |
+          set -euo pipefail
+          case "$REF_NAME" in
+            develop|feature/*) TYPE=dev ;;
+            release/*)         TYPE=release ;;
+            hotfix/*)          TYPE=hotfix ;;
+          esac
+          if [ "$TYPE" = hotfix ] && [ -n "$HOTFIX_CHAIN" ]; then CH="$HOTFIX_CHAIN"; else CH="$CHAIN"; fi
+
+          echo "$CH" | jq -e 'type == "array" and length >= 1 and all(type == "object" and (.env | type == "string" and length > 0) and (.subenvs | type == "string" and length > 0))' >/dev/null \
+            || { echo "::error::environment-chain debe ser una lista JSON de {env, subenvs}"; exit 1; }
+
+          if [ "$TYPE" = dev ]; then
+            # develop y feature: solo el primer entorno, sin aprobación ni pre-aprobación
+            TARGETS=$(jq -c '[ .[0] | {env, subenvs, first: true, approval: false, pre: false} ]' <<< "$CH")
+          else
+            [ "$(jq 'length' <<< "$CH")" -ge 2 ] || { echo "::error::release y hotfix requieren al menos 2 entornos"; exit 1; }
+            # Solo el último exige aprobación; el penúltimo ejecuta las pruebas funcionales
+            TARGETS=$(jq -c '(length) as $n
+              | [ to_entries[] | {env: .value.env, subenvs: .value.subenvs, first: (.key == 0),
+                                  approval: (.key == ($n - 1)), pre: (.key == ($n - 2))} ]' <<< "$CH")
+          fi
+          RTARGETS=$(jq -c 'reverse' <<< "$TARGETS")
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "rollback-targets=$RTARGETS" >> "$GITHUB_OUTPUT"
+          echo "Entornos de la ejecución: $TARGETS" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Deploy por entorno, en orden de la cadena.
+  #    Matriz con max-parallel 1 y fail-fast: un fallo detiene los siguientes.
+  #    Las pruebas funcionales son el último paso del elemento "pre" (penúltimo entorno).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Desplegar en ${{ matrix.target.env }}
+    needs: checks
+    if: ${{ inputs.mode == 'deploy' }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJSON(needs.checks.outputs.targets) }}
+    runs-on: ${{ fromJSON(matrix.target.approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ matrix.target.env }}
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      SISNET_STORE_HOST: ${{ vars.SISNET_STORE_HOST }}
+      SISNET_STORE_USER: ${{ secrets.SEC_SISNET_STORE_USER }}
+      SISNET_STORE_PASSWORD: ${{ secrets.SEC_SISNET_STORE_PASSWORD }}
+      ORCH: ${{ inputs.orchestra-file }}
+      SUBENVS: ${{ matrix.target.subenvs }}
+      ENV_NAME: ${{ matrix.target.env }}
+      FUNCTIONAL_CMD: ${{ inputs.functional-test-command }}
+    steps:
+      - name: Checkout (SHA del push)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Preparar credenciales y funciones de la API Studio
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SISNET_STORE_HOST" || { echo "::error::Falta la variable SISNET_STORE_HOST en el entorno $ENV_NAME"; exit 1; }
+          printf 'machine %s login %s password %s\n' "$SISNET_STORE_HOST" "$SISNET_STORE_USER" "$SISNET_STORE_PASSWORD" \
+            > "$RUNNER_TEMP/sisnet.netrc"
+          cat > "$RUNNER_TEMP/sisnet-lib.sh" <<'LIB'
+          enc()  { jq -rn --arg v "$1" '$v | @uri'; }
+          safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+          api() { # $1 método, $2 ruta (tras entornos-store), $3 fichero de salida, $4 fichero JSON opcional
+            local args=(-sS --netrc-file "$RUNNER_TEMP/sisnet.netrc" -X "$1" -H 'Accept: application/json' -o "$3" -w '%{http_code}')
+            if [ -n "${4:-}" ]; then args+=(-H 'Content-Type: application/json' --data-binary "@$4"); fi
+            local code
+            code=$(curl "${args[@]}" "https://$SISNET_STORE_HOST/studio/api/v1/entornos-store$2")
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "::error::HTTP $code en $1 $2"; return 1
+            fi
+          }
+          # Instantánea del estado de un subentorno: GET por etiqueta o por paquete, y normalización a {nombrePaquete, versionPaquete}.
+          # El formato exacto de respuesta de la API se extrae de forma recursiva; validar contra el entorno real (ver README).
+          snapshot() { # $1 subentorno, $2 directorio de salida
+            local sub=$1 dir=$2 n=0 item label name
+            mkdir -p "$dir/$sub"; rm -f "$dir/$sub"/*.json
+            while IFS= read -r item; do
+              n=$((n + 1))
+              if [ "$(jq -r 'has("label")' <<< "$item")" = "true" ]; then
+                label=$(jq -r '.label' <<< "$item")
+                api GET "/$sub/paquetes/versiones?codietiq=$(enc "$label")" "$dir/$sub/$n.json"
+              else
+                while IFS= read -r name; do
+                  api GET "/$sub/paquetes/$(enc "$name")/versiones" "$dir/$sub/$n-$(safe "$name").json"
+                done < <(jq -r '.package[].nombrePaquete' <<< "$item")
+              fi
+            done < <(jq -c '.version_to_deploy.store[]' "$ORCH")
+            jq -s -c '[ .[] | .. | objects | select(has("nombrePaquete") and has("versionPaquete"))
+                        | {nombrePaquete, versionPaquete} ] | unique' "$dir/$sub"/*.json > "$dir/$sub.packages.json"
+          }
+          LIB
+          echo "Funciones preparadas"
+
+      - name: Backup del estado previo (y comprobación entre subentornos)
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/sisnet-lib.sh"
+          mkdir -p sisnet-backup
+          REF=""
+          for sub in $(echo "$SUBENVS" | tr ',' ' '); do
+            snapshot "$sub" sisnet-backup
+            COUNT=$(jq 'length' "sisnet-backup/$sub.packages.json")
+            if [ "$COUNT" -eq 0 ]; then
+              echo "::error::No se pudo extraer el estado previo de $sub. Revisar el formato de respuesta de la API."; exit 1
+            fi
+            CUR=$(jq -S . "sisnet-backup/$sub.packages.json" | md5sum)
+            if [ -z "$REF" ]; then REF="$CUR"; elif [ "$REF" != "$CUR" ]; then
+              echo "::error::Los subentornos de $ENV_NAME no tienen los mismos paquetes (Sisnet exige el mismo conjunto)"; exit 1
+            fi
+          done
+          echo "Backup OK en $ENV_NAME: subentornos $SUBENVS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar backup de rollback
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sisnet-backup-${{ matrix.target.env }}
+          path: sisnet-backup/
+          retention-days: 30
+
+      - name: Instalar versión de version_orchestra.json
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/sisnet-lib.sh"
+          mkdir -p sisnet-install
+          for sub in $(echo "$SUBENVS" | tr ',' ' '); do
+            mkdir -p "sisnet-install/$sub"
+            n=0
+            while IFS= read -r item; do
+              n=$((n + 1))
+              if [ "$(jq -r 'has("label")' <<< "$item")" = "true" ]; then
+                api POST "/$sub/paquetes/versiones/instalacion?etiqueta=$(enc "$(jq -r '.label' <<< "$item")")" "sisnet-install/$sub/$n.json"
+              else
+                jq -c '[ .package[] | {nombrePaquete, versionPaquete} ]' <<< "$item" > "sisnet-install/$sub/$n.payload.json"
+                api POST "/$sub/paquetes/versiones/instalacion" "sisnet-install/$sub/$n.json" "sisnet-install/$sub/$n.payload.json"
+              fi
+            done < <(jq -c '.version_to_deploy.store[]' "$ORCH")
+            if grep -qE 'PROCINST|PROCDESI|ERRORINS|ERRORDES' "sisnet-install/$sub"/*.json; then
+              echo "::error::La instalación en $sub devolvió estados KO"; exit 1
+            fi
+          done
+
+      - name: Verificar estado posterior a la instalación
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/sisnet-lib.sh"
+          mkdir -p sisnet-verify
+          for sub in $(echo "$SUBENVS" | tr ',' ' '); do
+            snapshot "$sub" sisnet-verify
+            if grep -qE 'PROCINST|PROCDESI|ERRORINS|ERRORDES' "sisnet-verify/$sub"/*.json; then
+              echo "::error::Verificación KO en $sub tras la instalación"; exit 1
+            fi
+          done
+
+      - name: Pruebas funcionales (penúltimo entorno, fail-closed)
+        if: ${{ matrix.target.pre }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FUNCTIONAL_CMD" ]; then
+            echo "::error::functional-test-command vacío. Release y hotfix no pueden llegar al último entorno sin pruebas funcionales."
+            exit 1
+          fi
+          bash -c "$FUNCTIONAL_CMD"
+
+      - name: Publicar resultados de instalación y verificación
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sisnet-result-${{ matrix.target.env }}
+          path: |
+            sisnet-install/
+            sisnet-verify/
+          if-no-files-found: ignore
+          retention-days: 15
+
+      - name: Eliminar credenciales temporales
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sisnet.netrc" "$RUNNER_TEMP/sisnet-lib.sh"
+
+  # ---------------------------------------------------------------------------
+  # 3. Rollback por entorno, en orden inverso de la cadena.
+  #    Usa el backup de la ejecución indicada en rollback-run-id (mismas aprobaciones del entorno).
+  # ---------------------------------------------------------------------------
+  rollback:
+    name: Rollback en ${{ matrix.target.env }}
+    needs: checks
+    if: ${{ inputs.mode == 'rollback' }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJSON(needs.checks.outputs.rollback-targets) }}
+    runs-on: ${{ fromJSON(matrix.target.approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ matrix.target.env }}
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SISNET_STORE_HOST: ${{ vars.SISNET_STORE_HOST }}
+      SISNET_STORE_USER: ${{ secrets.SEC_SISNET_STORE_USER }}
+      SISNET_STORE_PASSWORD: ${{ secrets.SEC_SISNET_STORE_PASSWORD }}
+      SUBENVS: ${{ matrix.target.subenvs }}
+      ENV_NAME: ${{ matrix.target.env }}
+      RUN_ID: ${{ inputs.rollback-run-id }}
+    steps:
+      - name: Comprobar run de origen del backup
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::rollback-run-id es obligatorio en mode=rollback"; exit 1
+          fi
+
+      - name: Descargar backup de la ejecución indicada
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sisnet-backup-${{ matrix.target.env }}
+          path: sisnet-backup
+          run-id: ${{ inputs.rollback-run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Preparar credenciales y funciones de la API Studio
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SISNET_STORE_HOST" || { echo "::error::Falta la variable SISNET_STORE_HOST en el entorno $ENV_NAME"; exit 1; }
+          printf 'machine %s login %s password %s\n' "$SISNET_STORE_HOST" "$SISNET_STORE_USER" "$SISNET_STORE_PASSWORD" \
+            > "$RUNNER_TEMP/sisnet.netrc"
+          cat > "$RUNNER_TEMP/sisnet-lib.sh" <<'LIB'
+          api() { # $1 método, $2 ruta, $3 salida, $4 JSON de entrada
+            local code
+            code=$(curl -sS --netrc-file "$RUNNER_TEMP/sisnet.netrc" -X "$1" -H 'Accept: application/json' \
+              -H 'Content-Type: application/json' --data-binary "@$4" -o "$3" -w '%{http_code}' \
+              "https://$SISNET_STORE_HOST/studio/api/v1/entornos-store$2")
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "::error::HTTP $code en $1 $2"; return 1
+            fi
+          }
+          LIB
+
+      - name: Ejecutar rollback de paquetes al estado previo
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/sisnet-lib.sh"
+          mkdir -p sisnet-rollback
+          for sub in $(echo "$SUBENVS" | tr ',' ' '); do
+            FILE="sisnet-backup/$sub.packages.json"
+            test -f "$FILE" || { echo "::error::El backup no contiene $sub"; exit 1; }
+            COUNT=$(jq 'length' "$FILE")
+            if [ "$COUNT" -eq 0 ]; then echo "::error::Backup vacío para $sub"; exit 1; fi
+            api POST "/$sub/paquetes/versiones/rollback" "sisnet-rollback/$sub.json" "$FILE"
+            if grep -qE 'PROCINST|PROCDESI|ERRORINS|ERRORDES' "sisnet-rollback/$sub.json"; then
+              echo "::error::Rollback KO en $sub"; exit 1
+            fi
+          done
+          echo "Rollback aplicado en $ENV_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Eliminar credenciales temporales
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sisnet.netrc" "$RUNNER_TEMP/sisnet-lib.sh"
+
+      - name: Publicar resultado del rollback
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sisnet-rollback-${{ matrix.target.env }}
+          path: sisnet-rollback/
+          if-no-files-found: ignore
+          retention-days: 15

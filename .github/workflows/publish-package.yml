@@ -1,0 +1,347 @@
+# Publicación de paquetes/librerías a un registro, solo desde tags vX.Y.Z en main.
+# Registros: npm, maven (Maven Central), nuget, pypi, go (validación de tag), container (chart de Helm en OCI, GHCR).
+# - Job `validate`: el tag debe ser "v<version>", la versión estable y el commit alcanzable desde main.
+# - Job `dry-run` (defecto): compila y comprueba el paquete desde el código, sin `environment:` ni credenciales de registro; nunca pide aprobación.
+# - Job `publish`: `environment: prod` (required reviewers), publicación real y atestación de procedencia.
+#   npm y PyPI usan OIDC (sin token); NuGet usa NuGet/login (token temporal); Maven Central usa la excepción SEC_*.
+# Versiones mínimas (T-30, verificadas en docs/validacion/T-30.md): npm >= 11.5.1 y Node >= 22.14.0 para trusted publishing;
+#   npm solo admite runners alojados por GitHub. Maven Central: único SEC_* del workflow (SEC_MAVEN_CENTRAL_TOKEN).
+# Documentación: pipelines/deploy/README.md y docs/publishing.md (WS4)
+name: publish-package
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "npm, maven, nuget, pypi, go o container."
+        required: true
+        type: string
+      version:
+        description: "Versión semver (X.Y.Z). Para publicar debe coincidir con el tag vX.Y.Z."
+        required: true
+        type: string
+      artifact-name:
+        description: "Nombre del artefacto subido por el build (WS2) en la misma ejecución. Obligatorio para publicar npm, maven, nuget y pypi."
+        required: false
+        type: string
+        default: ""
+      artifact-path:
+        description: "Fichero o glob relativo a la raíz del artefacto (npm .tgz, nupkg, whl/tar.gz, jar). Para container: directorio del chart de Helm."
+        required: false
+        type: string
+        default: ""
+      dry-run:
+        description: "true (defecto): solo compila y comprueba. false: publica (solo desde tag v*)."
+        required: false
+        type: boolean
+        default: true
+      runtime-version:
+        description: "Versión del runtime del registro (node, java, dotnet, python). Vacío = valor por defecto del workflow."
+        required: false
+        type: string
+        default: ""
+      runner:
+        description: 'Runner en JSON. Por defecto hosted ("ubuntu-latest").'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      package-id:
+        description: "Identificador publicado, p. ej. npm:@acme/lib@1.2.3."
+        value: ${{ jobs.publish.outputs.package-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry-run }}
+      ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      ARTIFACT_PATH: ${{ inputs.artifact-path }}
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout completo (para comprobar que el tag está en main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validar tag, versión y origen
+        run: |
+          set -euo pipefail
+          case "$REGISTRY" in npm|maven|nuget|pypi|go|container) ;; *) echo "::error::registry no soportado: $REGISTRY"; exit 1 ;; esac
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version no es semver: $VERSION"; exit 1
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry-run: no se publica nada."
+            exit 0
+          fi
+          # Publicación real: solo desde un tag v* con versión estable.
+          if [ "$REF_TYPE" != "tag" ] || [[ "$REF_NAME" != v* ]]; then
+            echo "::error::la publicación real solo se permite desde un tag v*"; exit 1
+          fi
+          if [ "$REF_NAME" != "v$VERSION" ]; then
+            echo "::error::el tag $REF_NAME no coincide con version=$VERSION"; exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::las versiones prerelease no se publican en registros públicos (2.4)"; exit 1
+          fi
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::el tag no apunta a un commit de main"; exit 1
+          fi
+          if [ "$REGISTRY" != "go" ] && [ "$REGISTRY" != "container" ] && [ -z "$ARTIFACT_NAME" ]; then
+            echo "::error::publicar $REGISTRY requiere artifact-name del build"; exit 1
+          fi
+          if [ "$REGISTRY" != "go" ] && [ "$REGISTRY" != "container" ] && [ -z "$ARTIFACT_PATH" ]; then
+            echo "::error::publicar $REGISTRY requiere artifact-path"; exit 1
+          fi
+
+  dry-run:
+    needs: validate
+    if: ${{ inputs.dry-run }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      contents: read
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      VERSION: ${{ inputs.version }}
+      CHART_PATH: ${{ inputs.artifact-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Node (npm)
+        if: inputs.registry == 'npm'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.runtime-version || '22' }}
+
+      - name: Instalar Java (maven)
+        if: inputs.registry == 'maven'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.runtime-version || '21' }}
+          cache: maven
+
+      - name: Instalar .NET (nuget)
+        if: inputs.registry == 'nuget'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ inputs.runtime-version || '8.0.x' }}
+
+      - name: Instalar Python (pypi)
+        if: inputs.registry == 'pypi'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ inputs.runtime-version || '3.12' }}
+
+      - name: Instalar Go (go)
+        if: inputs.registry == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Instalar Helm (container)
+        if: inputs.registry == 'container'
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+
+      - name: Compilar y comprobar el paquete
+        run: |
+          set -euo pipefail
+          case "$REGISTRY" in
+            npm)
+              npm ci
+              npm run build --if-present
+              npm publish --dry-run --access public
+              ;;
+            maven)
+              mvn -B -DskipTests verify
+              ;;
+            nuget)
+              dotnet pack -c Release -p:PackageVersion="$VERSION" -o dist
+              ;;
+            pypi)
+              python -m pip install --upgrade build twine
+              python -m build --outdir dist
+              python -m twine check dist/*
+              ;;
+            go)
+              go vet ./...
+              go test ./...
+              ;;
+            container)
+              helm lint "$CHART_PATH"
+              helm package "$CHART_PATH" --version "$VERSION" --app-version "$VERSION" -d "$RUNNER_TEMP/chart"
+              ;;
+          esac
+
+  publish:
+    needs: validate
+    if: ${{ !inputs.dry-run && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment:
+      name: prod
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
+    outputs:
+      package-id: ${{ steps.id.outputs.package-id }}
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_PATH: ${{ inputs.artifact-path }}
+      OWNER: ${{ github.repository_owner }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Descargar artefacto del build (mismo run)
+        if: ${{ inputs.artifact-name != '' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+
+      - name: Instalar Node (npm)
+        if: inputs.registry == 'npm'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.runtime-version || '22' }}
+          # Sin registry-url: setup-node escribiría un .npmrc con NODE_AUTH_TOKEN y anularía OIDC.
+
+      - name: "npm: publicar con trusted publishing (OIDC + provenance)"
+        if: inputs.registry == 'npm'
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          # Trusted publishing de npm: runner alojado por GitHub, npm >= 11.5.1 y Node >= 22.14.0.
+          if [ "$RUNNER_ENVIRONMENT" != "github-hosted" ]; then
+            echo "::error::npm trusted publishing no admite runners self-hosted"; exit 1
+          fi
+          npm install -g "npm@^11.5.1"
+          node_min=$(printf '%s\n' 22.14.0 "$(node -p 'process.versions.node')" | sort -V | head -n 1)
+          npm_min=$(printf '%s\n' 11.5.1 "$(npm --version)" | sort -V | head -n 1)
+          [ "$node_min" = "22.14.0" ] || { echo "::error::Node $(node -p 'process.versions.node') < 22.14.0"; exit 1; }
+          [ "$npm_min" = "11.5.1" ] || { echo "::error::npm $(npm --version) < 11.5.1"; exit 1; }
+          name=$(node -p "require('./package.json').name")
+          # Versión duplicada: npm no admite republicar la misma versión; se corta antes con un mensaje claro.
+          if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+            echo "::error::$name@$VERSION ya existe en npm"; exit 1
+          fi
+          file=$(ls -1 "dist/$ARTIFACT_PATH" | head -n 1)
+          # Sin --provenance: con trusted publishing en GitHub Actions la procedencia se genera por defecto.
+          npm publish "$file" --access public
+
+      - name: Instalar Java (maven)
+        if: inputs.registry == 'maven'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.runtime-version || '21' }}
+          cache: maven
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      # SEC_MAVEN_CENTRAL_TOKEN: la documentación oficial del Portal solo describe user tokens (sin OIDC).
+      # Entorno prod; caducidad y responsable en governance/secrets-inventory.md (rotación 90 días).
+      - name: "maven: publicar en Maven Central (excepción SEC_*, sin OIDC disponible)"
+        if: inputs.registry == 'maven'
+        env:
+          MAVEN_USERNAME: ${{ vars.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.SEC_MAVEN_CENTRAL_TOKEN }}
+        run: mvn -B deploy -DskipTests
+
+      - name: Instalar .NET (nuget)
+        if: inputs.registry == 'nuget'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ inputs.runtime-version || '8.0.x' }}
+
+      - name: "nuget: token temporal por OIDC (NuGet/login)"
+        if: inputs.registry == 'nuget'
+        id: nuget
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_PROFILE_USER }}
+
+      - name: "nuget: publicar"
+        if: inputs.registry == 'nuget'
+        env:
+          NUGET_API_KEY: ${{ steps.nuget.outputs.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          file=$(ls -1 dist/$ARTIFACT_PATH | head -n 1)
+          dotnet nuget push "$file" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+
+      - name: Instalar Python (pypi)
+        if: inputs.registry == 'pypi'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ inputs.runtime-version || '3.12' }}
+
+      - name: "pypi: publicar con trusted publishing (OIDC, sin password)"
+        if: inputs.registry == 'pypi'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1 (SHA fijado; upstream recomienda la rama release/v1)
+        with:
+          packages-dir: dist/
+
+      - name: Instalar Go (go)
+        if: inputs.registry == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Go no tiene registro: la "publicación" es el tag vX.Y.Z (módulo en raíz o en su sufijo /vN).
+      # Tags con prefijo de subdirectorio (sub/vX.Y.Z) no pasan la validación de tag de este workflow.
+      - name: "go: validar que el módulo resuelve la versión del tag"
+        if: inputs.registry == 'go'
+        run: |
+          set -euo pipefail
+          module=$(go list -m)
+          GOPROXY=https://proxy.golang.org go list -m "$module@v$VERSION"
+
+      - name: Instalar Helm (container)
+        if: inputs.registry == 'container'
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+
+      - name: "container: publicar chart de Helm en OCI (GHCR, GITHUB_TOKEN)"
+        if: inputs.registry == 'container'
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package "$ARTIFACT_PATH" --version "$VERSION" --app-version "$VERSION" -d "$RUNNER_TEMP/chart"
+          tgz=$(ls -1 "$RUNNER_TEMP"/chart/*.tgz | head -n 1)
+          helm push "$tgz" "oci://ghcr.io/$OWNER/charts"
+
+      - name: "Atestar procedencia (paquetes con fichero)"
+        if: ${{ contains('npm maven nuget pypi', inputs.registry) }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ inputs.artifact-path }}
+
+      - name: "Atestar procedencia (chart de Helm)"
+        if: inputs.registry == 'container'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/chart/*.tgz
+
+      - name: Identificador publicado
+        id: id
+        run: echo "package-id=$REGISTRY:$VERSION" >> "$GITHUB_OUTPUT"

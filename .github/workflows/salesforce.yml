@@ -1,0 +1,764 @@
+# Workflow reutilizable: Salesforce (Apex y metadatos) para low-code.
+# Equivalente a Pipeline_Salesforce / Salesforce_{develop,feature,release}.groovy y a
+# buildSalesforce.groovy / code_analyzer.groovy de la librería Jenkins.
+# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/salesforce.yml
+# Ver README.md de esta carpeta.
+#
+# Entornos: NO son fijos. El caller pasa environment-chain (lista JSON ordenada de nombres de entorno GitHub).
+#   - feature/* y develop: solo se usa el primer entorno de la cadena.
+#   - release/* y hotfix/*: se despliega la cadena completa; el último entorno exige aprobación
+#     (required reviewers en GitHub); el penúltimo ejecuta las pruebas funcionales antes de él.
+# Cada entorno define: vars SF_USERNAME, SF_INSTANCE_URL, SF_PROXY y SF_NO_PROXY (opcionales),
+#                      secrets SEC_SF_CONSUMER_KEY y SEC_SF_JWT_KEY (JWT: Salesforce no admite OIDC de GitHub).
+# Aprobaciones del último entorno: input prod-approvals (constante única, 1 por defecto).
+
+name: lowcode-salesforce
+
+on:
+  workflow_call:
+    inputs:
+      environment-chain:
+        description: 'Lista JSON ordenada de entornos GitHub, del primero al último. Ejemplo: ["<entorno-1>","<entorno-2>","<entorno-3>"]. Release y hotfix requieren al menos 2.'
+        type: string
+        required: true
+      prod-approvals:
+        # CONSTANTE ÚNICA de aprobaciones del último entorno de la cadena.
+        # 1 = validar y desplegar en el mismo job (una aprobación). 2 = validar en un job aprobado y desplegar en otro.
+        description: "Aprobaciones del último entorno de la cadena por despliegue: 1 o 2."
+        type: number
+        default: 1
+      sf-cli-version:
+        description: "Versión exacta de @salesforce/cli (npm). Obligatoria."
+        type: string
+        required: true
+      sgd-version:
+        description: "Versión exacta del plugin sfdx-git-delta. Obligatoria."
+        type: string
+        required: true
+      code-analyzer-version:
+        description: "Versión exacta del plugin @salesforce/plugin-code-analyzer. Obligatoria."
+        type: string
+        required: true
+      project-dir:
+        description: "Raíz del proyecto SFDX dentro del repo."
+        type: string
+        default: "."
+      code-analyzer-mode:
+        description: "report: solo informa. block: falla si se superan los umbrales."
+        type: string
+        default: "report"
+      code-analyzer-thresholds:
+        description: "Máximos permitidos por severidad (JSON). -1 = no evaluar. Equivale a code_quality.code_analyzer.criterials."
+        type: string
+        default: '{"total":-1,"critical":0,"high":-1,"normal":-1,"low":-1,"info":-1}'
+      base-commit:
+        description: "Commit base del delta. Vacío = último tag v* distinto de HEAD (ver README)."
+        type: string
+        default: ""
+      deploy-from-feature:
+        description: "Permite desplegar en el primer entorno desde ramas feature. Por defecto no: feature solo valida."
+        type: boolean
+        default: false
+      apply-destructive-changes:
+        description: "Aplicar destructiveChanges. Por defecto no (la librería Jenkins tampoco lo aplica)."
+        type: boolean
+        default: false
+      functional-test-command:
+        description: "Comando de pruebas funcionales en el penúltimo entorno. Obligatorio en release y hotfix (fail-closed)."
+        type: string
+        default: ""
+      runner-labels:
+        description: "Etiquetas JSON del runner para entornos sin aprobación."
+        type: string
+        default: '["self-hosted","linux","x64"]'
+      runner-approval-labels:
+        description: "Etiquetas JSON del runner para el último entorno (con aprobación)."
+        type: string
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lowcode-salesforce-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Rama, commit base, tests RUNTEST y cadena de entornos.
+  # ---------------------------------------------------------------------------
+  context:
+    name: Contexto de la rama, cadena de entornos y commit base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      branch-type: ${{ steps.ctx.outputs.branch-type }}
+      base-commit: ${{ steps.ctx.outputs.base-commit }}
+      run-tests: ${{ steps.ctx.outputs.run-tests }}
+      deploy-targets: ${{ steps.ctx.outputs.deploy-targets }}
+      pre-approval-env: ${{ steps.ctx.outputs.pre-approval-env }}
+      approval-env: ${{ steps.ctx.outputs.approval-env }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Clasificar rama, cadena y commit base
+        id: ctx
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          BASE_OVERRIDE: ${{ inputs.base-commit }}
+          CHAIN: ${{ inputs.environment-chain }}
+          PROD_APPROVALS: ${{ inputs.prod-approvals }}
+          DEPLOY_FROM_FEATURE: ${{ inputs.deploy-from-feature }}
+        run: |
+          set -euo pipefail
+          case "$REF_NAME" in
+            develop)   TYPE=develop ;;
+            feature/*) TYPE=feature ;;
+            release/*) TYPE=release ;;
+            hotfix/*)  TYPE=hotfix ;;
+            *) echo "::error::La rama $REF_NAME no tiene pipeline Salesforce (develop, feature/*, release/*, hotfix/*)"; exit 1 ;;
+          esac
+
+          echo "$CHAIN" | jq -e 'type == "array" and length >= 1 and all(type == "string" and length > 0)' >/dev/null \
+            || { echo "::error::environment-chain debe ser una lista JSON de nombres de entorno"; exit 1; }
+          N=$(jq 'length' <<< "$CHAIN")
+          case "$PROD_APPROVALS" in 1|2) ;; *) echo "::error::prod-approvals debe ser 1 o 2"; exit 1 ;; esac
+
+          if [ "$TYPE" = feature ] || [ "$TYPE" = develop ]; then
+            USED=$(jq -c '[.[0]]' <<< "$CHAIN")
+            DEPLOY=$([ "$TYPE" = develop ] && echo true || echo "$DEPLOY_FROM_FEATURE")
+            APPROVAL=""; PRE=""
+          else
+            [ "$N" -ge 2 ] || { echo "::error::release y hotfix requieren al menos 2 entornos en environment-chain"; exit 1; }
+            USED=$(jq -c '.[0:-1]' <<< "$CHAIN")
+            DEPLOY=true
+            APPROVAL=$(jq -r '.[-1]' <<< "$CHAIN")
+            PRE=$(jq -r '.[-2]' <<< "$CHAIN")
+          fi
+
+          TARGETS=$(jq -c --argjson deploy "$DEPLOY" '[ to_entries[] | {env: .value, first: (.key == 0), deploy: $deploy} ]' <<< "$USED")
+
+          BASE=$BASE_OVERRIDE
+          if [ -z "$BASE" ]; then
+            if [ "$TYPE" = feature ]; then
+              git fetch --no-tags origin develop:refs/remotes/origin/develop
+              BASE=$(git merge-base origin/develop HEAD)
+            else
+              HEAD_SHA=$(git rev-parse HEAD)
+              for tag in $(git tag --list 'v*' --sort=-v:refname); do
+                c=$(git rev-list -n 1 "$tag")
+                if [ "$c" != "$HEAD_SHA" ]; then BASE=$c; break; fi
+              done
+            fi
+          fi
+          if [ -z "$BASE" ]; then echo "::error::No se pudo calcular el commit base. Define base-commit."; exit 1; fi
+
+          # Equivale a los commits "RUNTEST=Clase1,Clase2" de la librería Jenkins
+          RUNTESTS=$(git log "$BASE"..HEAD --format=%s \
+            | sed -n 's/.*RUNTEST=\([^"]*\).*/\1/p' \
+            | sed 's/(#[^)]*)//g; s/"//g' \
+            | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | sort -u \
+            | paste -sd' ' - || true)
+
+          {
+            echo "branch-type=$TYPE"
+            echo "base-commit=$BASE"
+            echo "run-tests=$RUNTESTS"
+            echo "deploy-targets=$TARGETS"
+            echo "pre-approval-env=$PRE"
+            echo "approval-env=$APPROVAL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tipo: $TYPE | entornos: $TARGETS | pre-aprobación: ${PRE:-ninguno} | aprobación: ${APPROVAL:-ninguna}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Salesforce Code Analyzer (equivale a code_analyzer.groovy)
+  # ---------------------------------------------------------------------------
+  analysis:
+    name: Salesforce Code Analyzer
+    needs: context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI y plugin code-analyzer
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+          CA_VERSION: ${{ inputs.code-analyzer-version }}
+        run: |
+          set -euo pipefail
+          npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+          sf plugins install "@salesforce/plugin-code-analyzer@${CA_VERSION}"
+          sf --version
+
+      - name: Preparar workspace (en feature solo ficheros cambiados)
+        id: ws
+        env:
+          TYPE: ${{ needs.context.outputs.branch-type }}
+          BASE: ${{ needs.context.outputs.base-commit }}
+          PROJECT_DIR: ${{ inputs.project-dir }}
+        run: |
+          set -euo pipefail
+          if [ "$TYPE" = feature ]; then
+            rm -rf selected-files && mkdir -p selected-files
+            git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- "$PROJECT_DIR" > changed.txt
+            if [ -s changed.txt ]; then
+              xargs -a changed.txt -d '\n' -I{} cp --parents {} selected-files/
+            fi
+            WS=selected-files
+          else
+            WS=$PROJECT_DIR
+          fi
+          if [ -n "$(find "$WS" -type f 2>/dev/null | head -n 1)" ]; then HAS=true; else HAS=false; fi
+          echo "workspace=$WS" >> "$GITHUB_OUTPUT"
+          echo "has-files=$HAS" >> "$GITHUB_OUTPUT"
+
+      - name: Ejecutar Salesforce Code Analyzer
+        if: steps.ws.outputs.has-files == 'true'
+        env:
+          WS: ${{ steps.ws.outputs.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          sf code-analyzer run --workspace "$WS" --view table --output-file artifacts/code-analyzer.json
+
+      - name: Evaluar umbrales (security gate)
+        if: steps.ws.outputs.has-files == 'true'
+        env:
+          MODE: ${{ inputs.code-analyzer-mode }}
+          THRESHOLDS: ${{ inputs.code-analyzer-thresholds }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            report|block) ;;
+            *) echo "::error::code-analyzer-mode debe ser report o block"; exit 1 ;;
+          esac
+
+          # Misma lógica que code_analyzer.groovy: usa violationCounts si existe; si no, cuenta violations[].
+          COUNTS=$(jq -c '
+            if .violationCounts then
+              { total: (.violationCounts.total // 0), critical: (.violationCounts.sev1 // 0),
+                high: (.violationCounts.sev2 // 0), normal: (.violationCounts.sev3 // 0),
+                low: (.violationCounts.sev4 // 0), info: (.violationCounts.sev5 // 0) }
+            else
+              (.violations // []) as $v
+              | { total: ($v | length),
+                  critical: ([$v[] | select(.severity == 1)] | length),
+                  high: ([$v[] | select(.severity == 2)] | length),
+                  normal: ([$v[] | select(.severity == 3)] | length),
+                  low: ([$v[] | select(.severity != 1 and .severity != 2 and .severity != 3 and .severity != 5)] | length),
+                  info: ([$v[] | select(.severity == 5)] | length) }
+            end' artifacts/code-analyzer.json)
+
+          BREACHES=$(jq -c --argjson c "$COUNTS" '
+            [ to_entries[] | . as $e
+              | select($e.value >= 0 and (($c[$e.key] // 0) > $e.value))
+              | { severidad: $e.key, encontrados: ($c[$e.key] // 0), maximo: $e.value } ]' <<< "$THRESHOLDS")
+
+          echo "$COUNTS" > artifacts/code-analyzer-metrics.json
+          echo "$BREACHES" > artifacts/code-analyzer-breaches.json
+          {
+            echo "### Salesforce Code Analyzer"
+            echo "- Modo: \`$MODE\`"
+            echo "- Conteos: \`$COUNTS\`"
+            echo "- Incumplimientos: \`$BREACHES\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$BREACHES" != "[]" ]; then
+            if [ "$MODE" = block ]; then
+              echo "::error::Security gate KO (mode=block): $BREACHES"
+              exit 1
+            fi
+            echo "::warning::Security gate KO en modo report: $BREACHES"
+          fi
+
+      - name: Publicar artefactos del análisis
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: code-analyzer
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 3. Build: delta de metadatos con sfdx-git-delta (equivale a delta() de buildSalesforce)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (delta de metadatos)
+    needs: context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has-changes: ${{ steps.delta.outputs.has-changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI y sfdx-git-delta
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+          SGD_VERSION: ${{ inputs.sgd-version }}
+        run: |
+          set -euo pipefail
+          npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+          sf plugins install "sfdx-git-delta@${SGD_VERSION}"
+
+      - name: Generar package.xml con el delta
+        id: delta
+        env:
+          BASE: ${{ needs.context.outputs.base-commit }}
+          PROJECT_DIR: ${{ inputs.project-dir }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          API=$(jq -r '.sourceApiVersion // empty' sfdx-project.json)
+          : "${API:?sfdx-project.json no define sourceApiVersion}"
+          IGNORE=()
+          if [ -f .sgdignore ]; then IGNORE=(-i .sgdignore); fi
+          sf sgd source delta --to "$GITHUB_SHA" --from "$BASE" "${IGNORE[@]}" -a "$API" --output-dir .
+
+          # Salida estable en delta-out/ (raíz del repo) para que los jobs de despliegue no dependan de project-dir
+          OUT="$GITHUB_WORKSPACE/delta-out"
+          mkdir -p "$OUT"
+          cp package/package.xml "$OUT/package.xml"
+          if [ -f destructiveChanges/package.xml ]; then
+            cp destructiveChanges/package.xml "$OUT/destructiveChanges.xml"
+          fi
+
+          if grep -q '<types>' "$OUT/package.xml"; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::El delta no contiene metadatos: no hay nada que validar ni desplegar."
+          fi
+
+      - name: Publicar delta (package.xml y destructiveChanges)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sf-delta
+          path: delta-out/
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 4. Entornos sin aprobación (todos menos el último de la cadena), en orden.
+  #    Cada elemento: validación check-only (con tests) y, si procede, quick deploy del id validado.
+  #    max-parallel 1 + fail-fast: un fallo detiene los siguientes.
+  # ---------------------------------------------------------------------------
+  deploy-chain:
+    name: Desplegar en ${{ matrix.target.env }}
+    needs: [context, build]
+    if: ${{ needs.build.outputs.has-changes == 'true' && needs.context.outputs.deploy-targets != '[]' }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJSON(needs.context.outputs.deploy-targets) }}
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    environment: ${{ matrix.target.env }}
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      SF_DISABLE_TELEMETRY: "true"
+      SF_SKIP_NEW_VERSION_CHECK: "true"
+      SF_DISABLE_LOG_FILE: "true"
+      SF_USERNAME: ${{ vars.SF_USERNAME }}
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+      SF_CONSUMER_KEY: ${{ secrets.SEC_SF_CONSUMER_KEY }}
+      SF_JWT_KEY: ${{ secrets.SEC_SF_JWT_KEY }}
+      HTTPS_PROXY: ${{ vars.SF_PROXY }}
+      HTTP_PROXY: ${{ vars.SF_PROXY }}
+      NO_PROXY: ${{ vars.SF_NO_PROXY }}
+      ENV_NAME: ${{ matrix.target.env }}
+    steps:
+      - name: Checkout (SHA del push)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Descargar delta (package.xml)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sf-delta
+          path: delta-out
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+        run: npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+
+      - name: Login JWT en la org
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$SF_JWT_KEY" > "$RUNNER_TEMP/sf-server.key"
+          sf org login jwt --client-id "$SF_CONSUMER_KEY" --jwt-key-file "$RUNNER_TEMP/sf-server.key" \
+            --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias target-org --set-default
+
+      - name: Validar despliegue (check-only)
+        id: validate
+        env:
+          FIRST: ${{ matrix.target.first }}
+          RUN_TESTS: ${{ needs.context.outputs.run-tests }}
+          APPLY_DESTRUCTIVE: ${{ inputs.apply-destructive-changes }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          # El primer entorno usa RUNTEST= si existe; el resto, RunLocalTests (igual que la librería Jenkins).
+          if [ "$FIRST" = "true" ] && [ -n "$RUN_TESTS" ]; then
+            read -r -a TESTS <<< "$RUN_TESTS"
+            TEST_ARGS=(--test-level RunSpecifiedTests --tests "${TESTS[@]}")
+          else
+            TEST_ARGS=(--test-level RunLocalTests)
+          fi
+          DESTR=()
+          if [ "$APPLY_DESTRUCTIVE" = "true" ] && [ -f delta-out/destructiveChanges.xml ] && grep -q '<types>' delta-out/destructiveChanges.xml; then
+            DESTR=(--post-destructive-changes delta-out/destructiveChanges.xml)
+          fi
+          sf project deploy validate --target-org target-org \
+            --manifest delta-out/package.xml "${TEST_ARGS[@]}" "${DESTR[@]}" \
+            --json --wait 120 > artifacts/validate.json
+          RC=$?
+          set -e
+          DEPLOY_ID=$(jq -r '.result.id // empty' artifacts/validate.json)
+          echo "deploy-id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Validación fallida en $ENV_NAME (rc=$RC)"
+            exit "$RC"
+          fi
+
+      - name: Quick deploy del id validado
+        if: ${{ matrix.target.deploy }}
+        env:
+          DEPLOY_ID: ${{ steps.validate.outputs.deploy-id }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_ID:?La validación no devolvió deploy id}"
+          sf project deploy quick --target-org target-org --job-id "$DEPLOY_ID" --wait 120 --json > artifacts/deploy.json
+
+      - name: Generar JUnit y resumen
+        if: always()
+        run: |
+          set -uo pipefail
+          F=artifacts/validate.json
+          [ -s "$F" ] || exit 0
+          ARR='def arr: if type == "array" then . elif . == null then [] else [.] end;'
+          jq -r "$ARR"'
+            (.result.details.runTestResult // {}) as $r
+            | ($r.successes | arr) as $ok
+            | ($r.failures | arr) as $ko
+            | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+              "<testsuite name=\"Salesforce validate\" tests=\"\($r.numTestsRun // 0)\" failures=\"\($ko | length)\">",
+              ($ok[] | "  <testcase classname=\"\(.name)\" name=\"\(.methodName)\" time=\"\((.time // 0) / 1000)\"/>"),
+              ($ko[] | "  <testcase classname=\"\(.name)\" name=\"\(.methodName)\"><failure message=\"\((.message // "fallo") | @html)\"/></testcase>"),
+              "</testsuite>"' "$F" > artifacts/junit-validate.xml || true
+          {
+            echo "### Validación $ENV_NAME"
+            jq -r "$ARR"'
+              (.result.details.runTestResult // {}) as $r
+              | ($r.codeCoverage | arr) as $c
+              | ([$c[].numLocations] | add // 0) as $t
+              | ([$c[].numLocationsNotCovered] | add // 0) as $n
+              | "- Tests ejecutados: \($r.numTestsRun // 0)",
+                "- Fallos: \(($r.failures | arr) | length)",
+                "- Cobertura global aproximada: \(if $t > 0 then ((100 * ($t - $n)) / $t | floor) else 0 end)%"' "$F" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Eliminar clave JWT
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sf-server.key"
+
+      - name: Publicar artefactos del despliegue
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deploy-${{ matrix.target.env }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 5. Pruebas funcionales en el penúltimo entorno (solo release y hotfix).
+  #    Fail-closed: sin comando configurado, el pipeline se detiene antes de la aprobación.
+  # ---------------------------------------------------------------------------
+  functional-tests:
+    name: Pruebas funcionales en ${{ needs.context.outputs.pre-approval-env }}
+    needs: [context, deploy-chain]
+    if: ${{ needs.context.outputs.pre-approval-env != '' && needs.deploy-chain.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    environment: ${{ needs.context.outputs.pre-approval-env }}
+    permissions:
+      contents: read
+    env:
+      SF_DISABLE_TELEMETRY: "true"
+      SF_SKIP_NEW_VERSION_CHECK: "true"
+      SF_DISABLE_LOG_FILE: "true"
+      SF_USERNAME: ${{ vars.SF_USERNAME }}
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+      SF_CONSUMER_KEY: ${{ secrets.SEC_SF_CONSUMER_KEY }}
+      SF_JWT_KEY: ${{ secrets.SEC_SF_JWT_KEY }}
+      HTTPS_PROXY: ${{ vars.SF_PROXY }}
+      HTTP_PROXY: ${{ vars.SF_PROXY }}
+      NO_PROXY: ${{ vars.SF_NO_PROXY }}
+      FUNCTIONAL_CMD: ${{ inputs.functional-test-command }}
+    steps:
+      - name: Comprobar que hay pruebas funcionales configuradas
+        run: |
+          if [ -z "$FUNCTIONAL_CMD" ]; then
+            echo "::error::functional-test-command vacío. Release y hotfix no pueden llegar al último entorno sin pruebas funcionales."
+            exit 1
+          fi
+
+      - name: Checkout (SHA del push)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+        run: npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+
+      - name: Login JWT en la org
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$SF_JWT_KEY" > "$RUNNER_TEMP/sf-server.key"
+          sf org login jwt --client-id "$SF_CONSUMER_KEY" --jwt-key-file "$RUNNER_TEMP/sf-server.key" \
+            --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias target-org --set-default
+
+      - name: Ejecutar pruebas funcionales
+        run: |
+          set -euo pipefail
+          bash -c "$FUNCTIONAL_CMD"
+
+      - name: Eliminar clave JWT
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sf-server.key"
+
+  # ---------------------------------------------------------------------------
+  # 6. Último entorno de la cadena (solo release y hotfix), con aprobación.
+  #    prod-approvals=2: validate-approval (aprobación 1) y deploy-approval (aprobación 2).
+  #    prod-approvals=1: deploy-approval valida y despliega en un solo job (aprobación única).
+  # ---------------------------------------------------------------------------
+  validate-approval:
+    name: Validar en ${{ needs.context.outputs.approval-env }} (aprobación 1 de 2)
+    needs: [context, build, functional-tests]
+    if: ${{ inputs.prod-approvals == 2 && needs.context.outputs.approval-env != '' && needs.build.outputs.has-changes == 'true' && needs.functional-tests.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.runner-approval-labels) }}
+    environment: ${{ needs.context.outputs.approval-env }}
+    permissions:
+      contents: read
+    outputs:
+      deploy-id: ${{ steps.validate.outputs.deploy-id }}
+    env:
+      SF_DISABLE_TELEMETRY: "true"
+      SF_SKIP_NEW_VERSION_CHECK: "true"
+      SF_DISABLE_LOG_FILE: "true"
+      SF_USERNAME: ${{ vars.SF_USERNAME }}
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+      SF_CONSUMER_KEY: ${{ secrets.SEC_SF_CONSUMER_KEY }}
+      SF_JWT_KEY: ${{ secrets.SEC_SF_JWT_KEY }}
+      HTTPS_PROXY: ${{ vars.SF_PROXY }}
+      HTTP_PROXY: ${{ vars.SF_PROXY }}
+      NO_PROXY: ${{ vars.SF_NO_PROXY }}
+    steps:
+      - name: Checkout (SHA del push)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Descargar delta (package.xml)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sf-delta
+          path: delta-out
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+        run: npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+
+      - name: Login JWT en la org
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$SF_JWT_KEY" > "$RUNNER_TEMP/sf-server.key"
+          sf org login jwt --client-id "$SF_CONSUMER_KEY" --jwt-key-file "$RUNNER_TEMP/sf-server.key" \
+            --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias target-org --set-default
+
+      - name: Validar despliegue (check-only, RunLocalTests)
+        id: validate
+        env:
+          APPLY_DESTRUCTIVE: ${{ inputs.apply-destructive-changes }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          DESTR=()
+          if [ "$APPLY_DESTRUCTIVE" = "true" ] && [ -f delta-out/destructiveChanges.xml ] && grep -q '<types>' delta-out/destructiveChanges.xml; then
+            DESTR=(--post-destructive-changes delta-out/destructiveChanges.xml)
+          fi
+          sf project deploy validate --target-org target-org \
+            --manifest delta-out/package.xml --test-level RunLocalTests "${DESTR[@]}" \
+            --json --wait 120 > artifacts/validate-approval.json
+          RC=$?
+          set -e
+          DEPLOY_ID=$(jq -r '.result.id // empty' artifacts/validate-approval.json)
+          echo "deploy-id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Validación fallida en el último entorno (rc=$RC)"
+            exit "$RC"
+          fi
+
+      - name: Eliminar clave JWT
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sf-server.key"
+
+      - name: Publicar artefactos de validación
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: validate-approval
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 15
+
+  deploy-approval:
+    name: Desplegar en ${{ needs.context.outputs.approval-env }}
+    needs: [context, build, functional-tests, validate-approval]
+    if: ${{ always() && needs.context.outputs.approval-env != '' && needs.build.outputs.has-changes == 'true' && needs.functional-tests.result == 'success' && (needs.validate-approval.result == 'success' || needs.validate-approval.result == 'skipped') }}
+    runs-on: ${{ fromJSON(inputs.runner-approval-labels) }}
+    environment: ${{ needs.context.outputs.approval-env }}
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      SF_DISABLE_TELEMETRY: "true"
+      SF_SKIP_NEW_VERSION_CHECK: "true"
+      SF_DISABLE_LOG_FILE: "true"
+      SF_USERNAME: ${{ vars.SF_USERNAME }}
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+      SF_CONSUMER_KEY: ${{ secrets.SEC_SF_CONSUMER_KEY }}
+      SF_JWT_KEY: ${{ secrets.SEC_SF_JWT_KEY }}
+      HTTPS_PROXY: ${{ vars.SF_PROXY }}
+      HTTP_PROXY: ${{ vars.SF_PROXY }}
+      NO_PROXY: ${{ vars.SF_NO_PROXY }}
+    steps:
+      - name: Checkout (SHA del push)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Descargar delta (package.xml)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sf-delta
+          path: delta-out
+
+      - name: Node.js para Salesforce CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Instalar Salesforce CLI
+        env:
+          SF_CLI_VERSION: ${{ inputs.sf-cli-version }}
+        run: npm install -g "@salesforce/cli@${SF_CLI_VERSION}"
+
+      - name: Login JWT en la org
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$SF_JWT_KEY" > "$RUNNER_TEMP/sf-server.key"
+          sf org login jwt --client-id "$SF_CONSUMER_KEY" --jwt-key-file "$RUNNER_TEMP/sf-server.key" \
+            --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias target-org --set-default
+
+      - name: Validar despliegue en este job (solo prod-approvals=1)
+        if: ${{ inputs.prod-approvals == 1 }}
+        id: inline-validate
+        env:
+          APPLY_DESTRUCTIVE: ${{ inputs.apply-destructive-changes }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          DESTR=()
+          if [ "$APPLY_DESTRUCTIVE" = "true" ] && [ -f delta-out/destructiveChanges.xml ] && grep -q '<types>' delta-out/destructiveChanges.xml; then
+            DESTR=(--post-destructive-changes delta-out/destructiveChanges.xml)
+          fi
+          sf project deploy validate --target-org target-org \
+            --manifest delta-out/package.xml --test-level RunLocalTests "${DESTR[@]}" \
+            --json --wait 120 > artifacts/validate-inline.json
+          RC=$?
+          set -e
+          DEPLOY_ID=$(jq -r '.result.id // empty' artifacts/validate-inline.json)
+          echo "deploy-id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Validación fallida en el último entorno (rc=$RC)"
+            exit "$RC"
+          fi
+
+      - name: Quick deploy del id validado
+        env:
+          DEPLOY_ID: ${{ inputs.prod-approvals == 1 && steps.inline-validate.outputs.deploy-id || needs.validate-approval.outputs.deploy-id }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_ID:?La validación no devolvió deploy id (revisar prod-approvals)}"
+          mkdir -p artifacts
+          sf project deploy quick --target-org target-org --job-id "$DEPLOY_ID" --wait 120 --json > artifacts/deploy-approval.json
+
+      - name: Eliminar clave JWT
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sf-server.key"
+
+      - name: Publicar resultado del despliegue
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deploy-approval
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 15

@@ -1,0 +1,244 @@
+# Workflow reutilizable de seguridad de contenedores (WS3).
+# Check que produce (contrato PLAN.md 2.1): Container / scan
+# Obligatorio solo en repos con custom property has-containers=true.
+#
+# Dos modos, según push:
+#
+# push: true  (main, tags, release). Entradas de WS2 (PLAN.md 2.4):
+#     image-name    -> <registry>/<repo>, sin tag ni digest
+#     image-digest  -> sha256:<64 hex>
+#   Escanea y firma SIEMPRE por digest. La imagen debe estar ya publicada en image-name.
+#
+# push: false (pull_request). La imagen se construyó en otro job de WS2 y se pasa
+#   como artefacto de Actions (image-artifact) que contiene un tar de `docker save`
+#   con la etiqueta image-name:image-tag. Este job la carga con `docker load`,
+#   la escanea localmente y NO firma. No requiere digest.
+#
+# Requisito de registro en push: si el registro no es ghcr.io, el caller debe haber
+# hecho login antes (OIDC, WS4) porque el job no lo hace.
+#
+# Permisos:
+#   packages: write  -> Cosign escribe la firma en el registro (GHCR), solo en push
+#   id-token: write  -> Cosign keyless (OIDC), solo en push
+#   security-events: write -> SARIF de Trivy y Hadolint
+
+name: Container
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: 'true en main/tags (escanea por digest y firma). false en PR (escanea la imagen local cargada desde image-artifact).'
+        type: boolean
+        required: false
+        default: true
+      image-name:
+        description: 'Nombre de la imagen sin tag ni digest, p. ej. ghcr.io/acme-payments/api'
+        type: string
+        required: true
+      image-digest:
+        description: 'Digest sha256:<64 hex>. Obligatorio si push=true.'
+        type: string
+        required: false
+        default: ''
+      image-tag:
+        description: 'Etiqueta local de la imagen. Obligatoria si push=false.'
+        type: string
+        required: false
+        default: ''
+      image-artifact:
+        description: 'Nombre del artefacto que contiene image.tar (docker save). Obligatorio si push=false.'
+        type: string
+        required: false
+        default: ''
+      security-config-repository:
+        description: 'Repo que contiene security/exceptions.yml y security/scripts/gen-ignores.mjs, p. ej. <org>-platform/security-config. Vacío = sin excepciones (fail-closed).'
+        type: string
+        required: false
+        default: ''
+      security-config-ref:
+        description: 'Ref de security-config a usar (SHA o tag).'
+        type: string
+        required: false
+        default: 'main'
+      dockerfile-path:
+        description: 'Ruta del Dockerfile a validar con Hadolint'
+        type: string
+        required: false
+        default: 'Dockerfile'
+      container-fail-on-severity:
+        description: 'Severidad mínima que bloquea: high (HIGH y CRITICAL) o critical (solo CRITICAL). Contrato: policy.yml fail_on.containers = high.'
+        type: string
+        required: false
+        default: 'high'
+      sign-image:
+        description: 'Firmar con Cosign keyless por digest. Solo aplica con push=true.'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    env:
+      PUSH: ${{ inputs.push }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      IMAGE_DIGEST: ${{ inputs.image-digest }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      IMAGE_ARTIFACT: ${{ inputs.image-artifact }}
+      SEVERITY_POLICY: ${{ inputs.container-fail-on-severity }}
+      # Mapeo del umbral de policy.yml a severidades de Trivy. Valores no válidos se rechazan en la validación.
+      TRIVY_SEVERITY: ${{ inputs.container-fail-on-severity == 'critical' && 'CRITICAL' || 'HIGH,CRITICAL' }}
+    steps:
+      - name: Validar entradas y resolver referencia de la imagen
+        id: validate
+        run: |
+          set -euo pipefail
+          if ! [[ "${IMAGE_NAME}" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$ ]]; then
+            echo "::error::image-name no válido: ${IMAGE_NAME}"; exit 1
+          fi
+          case "${SEVERITY_POLICY}" in
+            high|critical) ;;
+            *) echo "::error::container-fail-on-severity debe ser high o critical"; exit 1 ;;
+          esac
+          if [ "${PUSH}" = "true" ]; then
+            if ! [[ "${IMAGE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "::error::push=true requiere image-digest válido (sha256:<64 hex>): ${IMAGE_DIGEST}"; exit 1
+            fi
+            REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          else
+            if ! [[ "${IMAGE_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::push=false requiere image-tag válido: ${IMAGE_TAG}"; exit 1
+            fi
+            if [ -z "${IMAGE_ARTIFACT}" ]; then
+              echo "::error::push=false requiere image-artifact con el tar de la imagen"; exit 1
+            fi
+            REF="${IMAGE_NAME}:${IMAGE_TAG}"
+          fi
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Imagen a escanear: ${REF} (severidades bloqueantes: ${TRIVY_SEVERITY})"
+
+      - name: Checkout (para el Dockerfile)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout de security-config (exceptions.yml y generador)
+        if: inputs.security-config-repository != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.security-config-repository }}
+          ref: ${{ inputs.security-config-ref }}
+          path: security-config
+          persist-credentials: false
+
+      - name: Generar ignorados por repositorio desde exceptions.yml
+        if: inputs.security-config-repository != ''
+        env:
+          SCOPE: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node security-config/security/scripts/gen-ignores.mjs "${RUNNER_TEMP}/ignores" \
+            --input security-config/security/exceptions.yml --scope "${SCOPE}"
+
+      - name: Sin configuración de excepciones (fail-closed, sin ignorados)
+        if: inputs.security-config-repository == ''
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ignores"
+          echo "::warning::security-config-repository vacío: no se aplica ninguna excepción."
+          : > "${RUNNER_TEMP}/ignores/.trivyignore"
+
+      - name: Hadolint SARIF (informativo)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: ${{ inputs.dockerfile-path }}
+          format: sarif
+          output-file: hadolint-results.sarif
+          no-fail: true
+
+      - name: Subir SARIF de Hadolint
+        if: always() && hashFiles('hadolint-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: hadolint-results.sarif
+          category: hadolint
+
+      - name: Hadolint (bloqueante en errores)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: ${{ inputs.dockerfile-path }}
+          failure-threshold: error
+
+      - name: Descargar imagen de PR (artefacto)
+        if: inputs.push == false
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.image-artifact }}
+          path: ${{ runner.temp }}/image
+
+      - name: Cargar imagen de PR en el daemon local
+        if: inputs.push == false
+        run: |
+          set -euo pipefail
+          docker load -i "${RUNNER_TEMP}/image/image.tar"
+          docker image inspect "${{ steps.validate.outputs.ref }}" >/dev/null
+
+      - name: Login en GHCR (push a ghcr.io)
+        if: inputs.push && startsWith(inputs.image-name, 'ghcr.io/')
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN_VALUE: ${{ github.token }}
+        run: |
+          echo "${GH_TOKEN_VALUE}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: Trivy SARIF (informativo)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.validate.outputs.ref }}
+          scanners: vuln
+          format: sarif
+          output: trivy-results.sarif
+          trivyignores: ${{ runner.temp }}/ignores/.trivyignore
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '0'
+          ignore-unfixed: false
+
+      - name: Subir SARIF de Trivy
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-container
+
+      - name: Trivy gate (bloqueante por umbral de policy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.validate.outputs.ref }}
+          scanners: vuln
+          format: table
+          trivyignores: ${{ runner.temp }}/ignores/.trivyignore
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+          ignore-unfixed: false
+
+      - name: Firmar imagen con Cosign por digest
+        if: inputs.push && inputs.sign-image
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Cosign sign (keyless, por digest)
+        if: inputs.push && inputs.sign-image
+        env:
+          SIGN_REF: ${{ steps.validate.outputs.ref }}
+        run: cosign sign --yes "${SIGN_REF}"

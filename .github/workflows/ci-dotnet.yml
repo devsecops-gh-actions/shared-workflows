@@ -1,0 +1,271 @@
+# ci-dotnet.yml
+# Workflow reutilizable: restore bloqueado, build, test y empaquetado de proyectos .NET.
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI .NET
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Subcarpeta del proyecto (monorepos). Relativa a la raiz del repo.
+        type: string
+        default: '.'
+      matrix:
+        description: 'JSON con combinaciones de runtime. Clave `dotnet`. Ej.: {"dotnet":["8.0.x","10.0.x"]}. Se fusiona con el valor por defecto.'
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` (dotnet publish, zip) o `library` (dotnet pack, .nupkg).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar `dotnet test` en la matriz.
+        type: boolean
+        default: true
+      publish:
+        description: Solo `library`. Valida tag vX.Y.Z frente a la version del proyecto. No publica; la publicacion es de publish-package.yml.
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+      project-path:
+        description: Ruta a .sln o .csproj relativa a working-directory. Vacio = autodetectar (un unico .sln, o un unico .csproj).
+        type: string
+        default: ''
+    outputs:
+      version:
+        description: Version semver (2.4).
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido.
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta del artefacto principal (.nupkg o .zip de publish) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+      package-id:
+        description: Solo library. `PackageId@version`.
+        value: ${{ jobs.build-and-test.outputs.package-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      primary: ${{ steps.matrix.outputs.primary }}
+    steps:
+      - name: Fusionar matriz con valores por defecto
+        id: matrix
+        env:
+          INPUT_MATRIX: ${{ inputs.matrix || '{}' }}
+        run: |
+          set -euo pipefail
+          defaults='{"dotnet":["10.0.x"]}'
+          m=$(jq -cn --argjson d "$defaults" --argjson i "$INPUT_MATRIX" '$d * $i')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "primary=$(jq -r '.dotnet[0]' <<< "$m")" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    if: ${{ inputs.run-tests }}
+    runs-on: ${{ matrix.os || fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
+
+      - name: Cache de paquetes NuGet (clave por packages.lock.json)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Detectar proyecto y verificar lockfiles
+        id: proj
+        env:
+          WD: ${{ inputs.working-directory }}
+          PROJ_INPUT: ${{ inputs.project-path }}
+        run: |
+          set -euo pipefail
+          cd "$WD"
+          proj="$PROJ_INPUT"
+          if [ -z "$proj" ]; then
+            if [ "$(ls *.sln 2>/dev/null | wc -l)" -eq 1 ]; then proj=$(ls *.sln)
+            elif [ "$(ls *.csproj 2>/dev/null | wc -l)" -eq 1 ]; then proj=$(ls *.csproj)
+            else echo "::error::No se puede autodetectar el proyecto. Indica project-path."; exit 1; fi
+          fi
+          [ -f "$proj" ] || { echo "::error::No existe el proyecto '$proj' en '$WD'."; exit 1; }
+          find . -name packages.lock.json -not -path '*/node_modules/*' | grep -q . \
+            || { echo "::error::Falta packages.lock.json (RestorePackagesWithLockFile=true). Es obligatorio."; exit 1; }
+          echo "project=$proj" >> "$GITHUB_OUTPUT"
+
+      - name: Restore bloqueado
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+        run: dotnet restore "$PROJ" --locked-mode
+
+      - name: Tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+        run: dotnet test "$PROJ" -c Release --no-restore
+
+  build-and-test:
+    name: build-and-test
+    needs: [prepare, test]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      artifact-path: ${{ steps.pkg.outputs.artifact-path }}
+      package-id: ${{ steps.pkg.outputs.package-id }}
+    steps:
+      - name: Comprobar resultado de tests
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$TEST_RESULT" != "success" ] && [ "$TEST_RESULT" != "skipped" ]; then
+            echo "::error::El job test ha terminado con '$TEST_RESULT'."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar .NET (runtime principal)
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ needs.prepare.outputs.primary }}
+
+      - name: Cache de paquetes NuGet (clave por packages.lock.json)
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Detectar proyecto y verificar lockfiles
+        id: proj
+        env:
+          WD: ${{ inputs.working-directory }}
+          PROJ_INPUT: ${{ inputs.project-path }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          cd "$WD"
+          proj="$PROJ_INPUT"
+          if [ -z "$proj" ]; then
+            if [ "$(ls *.sln 2>/dev/null | wc -l)" -eq 1 ]; then proj=$(ls *.sln)
+            elif [ "$(ls *.csproj 2>/dev/null | wc -l)" -eq 1 ]; then proj=$(ls *.csproj)
+            else echo "::error::No se puede autodetectar el proyecto. Indica project-path."; exit 1; fi
+          fi
+          [ -f "$proj" ] || { echo "::error::No existe el proyecto '$proj' en '$WD'."; exit 1; }
+          find . -name packages.lock.json -not -path '*/node_modules/*' | grep -q . \
+            || { echo "::error::Falta packages.lock.json (RestorePackagesWithLockFile=true). Es obligatorio."; exit 1; }
+          echo "project=$proj" >> "$GITHUB_OUTPUT"
+
+      - name: Restore bloqueado
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+        run: dotnet restore "$PROJ" --locked-mode
+
+      - name: Calcular version y nombre de artefacto
+        id: meta
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+          PUBLISH: ${{ inputs.publish }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          base=$(dotnet msbuild "$PROJ" -getProperty:Version -nologo 2>/dev/null | tail -n1 || true)
+          base="${base%%[-+]*}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base:-0.0.0}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            [ "$KIND" = "library" ] || { echo "::error::publish=true solo aplica a kind=library."; exit 1; }
+            [[ "$GITHUB_REF" == refs/tags/v* ]] || { echo "::error::publish=true requiere un tag v*."; exit 1; }
+            [ "$version" = "$base" ] || { echo "::error::El tag ($version) no coincide con <Version> del proyecto ($base)."; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: dotnet build "$PROJ" -c Release --no-restore -p:Version="$VERSION"
+
+      - name: Empaquetar
+        id: pkg
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PROJ: ${{ steps.proj.outputs.project }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact-name }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$out"
+          if [ "$KIND" = "library" ]; then
+            dotnet pack "$PROJ" -c Release --no-restore -p:Version="$VERSION" -o "$out"
+            main=$(ls "$out"/*.nupkg | grep -v '\.symbols\.nupkg$' | head -n1)
+            pid=$(dotnet msbuild "$PROJ" -getProperty:PackageId -nologo 2>/dev/null | tail -n1 || true)
+            [ -n "$pid" ] || pid=$(dotnet msbuild "$PROJ" -getProperty:AssemblyName -nologo 2>/dev/null | tail -n1)
+            echo "package-id=$pid@$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            dotnet publish "$PROJ" -c Release --no-restore -p:Version="$VERSION" -o publish
+            main="$out/$ARTIFACT_NAME.zip"
+            (cd publish && zip -qr "$main" .)
+            echo "package-id=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "artifact-path=artifacts/$(basename "$main")" >> "$GITHUB_OUTPUT"
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

@@ -1,0 +1,397 @@
+# Despliegue a PaaS con contenedor por digest: Azure App Service (slots) o Google Cloud Run (revisiones).
+# OIDC en ambos proveedores, sin secretos estáticos.
+#   rolling    -> la aplicación pasa directamente a la imagen nueva.
+#   blue-green -> App Service: despliegue en el slot de staging y swap a producción (el swap se revierte con otro swap).
+#                 Cloud Run: la revisión nueva se despliega sin tráfico y se conmuta al 100%; la previa queda fijada para rollback.
+#   canary     -> App Service: tráfico dividido con el slot de staging y swap final.
+#                 Cloud Run: tráfico dividido entre la revisión nueva y la previa.
+# Documentación: pipelines/deploy/README.md
+# Verificación T-28 (docs oficiales de Microsoft Learn consultadas 2026-11-13; detalle en docs/validacion/T-28.md):
+#   CONFIRMADO: az webapp deployment slot swap (--slot, --target-slot; revertir = repetir el swap con los mismos slots),
+#               az webapp traffic-routing set --distribution <slot>=<%> y clear, az webapp config container set (--slot, --container-image-name, --container-registry-url).
+#   NO VERIFICADO: que la configuración de imagen del contenedor se intercambie en el swap (la doc no la lista); Cloud Run fuera del alcance de T-28.
+name: deploy-paas
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod."
+        required: true
+        type: string
+      platform:
+        description: "azure-app-service o cloud-run."
+        required: true
+        type: string
+      version:
+        description: "Versión desplegada (contrato 2.4)."
+        required: true
+        type: string
+      artifact-ref:
+        description: "Imagen por digest: <registry>/<repo>@sha256:<64 hex>."
+        required: true
+        type: string
+      strategy:
+        description: "rolling (defecto), blue-green o canary."
+        required: false
+        type: string
+        default: rolling
+      canary-steps:
+        description: "Pesos de tráfico a la versión nueva en %, crecientes y terminados en 100, p. ej. 10,50,100."
+        required: false
+        type: string
+        default: "10,50,100"
+      canary-pause-seconds:
+        description: "Pausa entre pasos del canary, en segundos."
+        required: false
+        type: number
+        default: 300
+      health-check-url:
+        description: "URL pública de la aplicación que debe responder 2xx tras el cambio."
+        required: true
+        type: string
+      rollback-on-failure:
+        description: "Revertir automáticamente si falla el despliegue o la comprobación de salud."
+        required: false
+        type: boolean
+      runner:
+        description: 'Runner en JSON. Por defecto hosted ("ubuntu-latest").'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      deployment-id:
+        description: "ID del deployment en la GitHub Deployments API."
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+      url:
+        description: "URL comprobada tras el despliegue."
+        value: ${{ jobs.deploy.outputs.url }}
+      version-deployed:
+        description: "Versión desplegada con éxito (vacía si falló)."
+        value: ${{ jobs.deploy.outputs.version-deployed }}
+      previous-version:
+        description: "Última versión exitosa anterior en este entorno (para rollback)."
+        value: ${{ jobs.deploy.outputs.previous-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-paas-${{ inputs.environment }}-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+      packages: read
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      PLATFORM: ${{ inputs.platform }}
+      STRATEGY: ${{ inputs.strategy }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      GH_ACTOR: ${{ github.actor }}
+    steps:
+      - name: Exigir rollback-on-failure=true en staging y prod
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLLBACK: ${{ inputs.rollback-on-failure }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENVIRONMENT" =~ ^(staging|prod)$ ]] && [ "$ROLLBACK" != "true" ]; then
+            echo "::error::rollback-on-failure debe ser true en $ENVIRONMENT (recibido: $ROLLBACK)"; exit 1
+          fi
+
+      - name: Validar contrato de entrada
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          case "$PLATFORM" in azure-app-service|cloud-run) ;; *) echo "::error::platform debe ser azure-app-service o cloud-run"; exit 1 ;; esac
+          case "$STRATEGY" in rolling|blue-green|canary) ;; *) echo "::error::strategy debe ser rolling, blue-green o canary"; exit 1 ;; esac
+          if ! [[ "$ARTIFACT_REF" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::artifact-ref debe ser una imagen por digest (@sha256:...)"; exit 1
+          fi
+          if [ "$STRATEGY" = "canary" ]; then
+            prev=0
+            IFS=',' read -ra W <<< "$CANARY_STEPS"
+            for w in "${W[@]}"; do
+              if ! [[ "$w" =~ ^[0-9]+$ ]] || [ "$w" -le "$prev" ] || [ "$w" -gt 100 ]; then
+                echo "::error::canary-steps inválido: $CANARY_STEPS"; exit 1
+              fi
+              prev=$w
+            done
+            if [ "$prev" -ne 100 ]; then echo "::error::canary-steps debe terminar en 100"; exit 1; fi
+          fi
+
+      - name: Verificar procedencia de la imagen (solo si existe atestación; bloqueante en prod)
+        run: |
+          set -euo pipefail
+          if [[ "$ARTIFACT_REF" != *@sha256:* ]]; then echo "Sin digest de imagen: se omite la verificación de procedencia."; exit 0; fi
+          digest="${ARTIFACT_REF##*@}"
+          count=$(gh api "repos/$REPO/attestations/$digest" --jq '.attestations | length' 2>/dev/null || echo 0)
+          if [ "$count" = "0" ]; then
+            msg="no existe atestación de procedencia para $digest en $REPO (genérala en el build, WS2)"
+            if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"; exit 0
+          fi
+          if [[ "$ARTIFACT_REF" == ghcr.io/* ]]; then echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin; fi
+          if gh attestation verify "oci://$ARTIFACT_REF" --owner "$OWNER"; then exit 0; fi
+          msg="la verificación de procedencia de $digest falló"
+          if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg"
+
+  deploy:
+    needs: validate
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.health-check-url }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      packages: read
+    outputs:
+      deployment-id: ${{ steps.dep.outputs.deployment-id }}
+      previous-version: ${{ steps.dep.outputs.previous-version }}
+      version-deployed: ${{ steps.out.outputs.version-deployed }}
+      url: ${{ steps.out.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      PLATFORM: ${{ inputs.platform }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      STRATEGY: ${{ inputs.strategy }}
+      HEALTH_URL: ${{ inputs.health-check-url }}
+      ROLLBACK_ON_FAILURE: ${{ inputs.rollback-on-failure }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      CANARY_PAUSE: ${{ inputs.canary-pause-seconds }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      APP: ${{ vars.PAAS_APP_NAME }}
+      SLOT: ${{ vars.PAAS_STAGING_SLOT || 'staging' }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Login Azure (OIDC, sin secreto)
+        if: inputs.platform == 'azure-app-service'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login GCP (Workload Identity Federation)
+        if: inputs.platform == 'cloud-run'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Calcular versión previa y registrar despliegue
+        id: dep
+        run: |
+          set -euo pipefail
+          prev=""
+          prev_ref=""
+          while IFS=$'\t' read -r id payload; do
+            [ -n "$id" ] || continue
+            state=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+            [ "$state" = "success" ] || continue
+            v=$(jq -r '.version // ""' <<< "$payload")
+            if [ -n "$v" ] && [ "$v" != "$VERSION" ]; then
+              prev="$v"; prev_ref=$(jq -r '.artifact_ref // ""' <<< "$payload"); break
+            fi
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | select((.payload.target // "") == "paas") | "\(.id)\t\(.payload|tostring)"')
+          payload=$(jq -cn --arg v "$VERSION" --arg r "$ARTIFACT_REF" --arg s "$STRATEGY" --arg p "$PLATFORM" \
+            '{version:$v, artifact_ref:$r, target:"paas", platform:$p, strategy:$s}')
+          digest=""
+          if [[ "$ARTIFACT_REF" == *@sha256:* ]]; then digest="${ARTIFACT_REF##*@}"; fi
+          payload=$(jq -c --arg d "$digest" --arg run "$GITHUB_RUN_ID" '. + {artifact_digest:$d, run_id:$run}' <<< "$payload")
+          dep_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg desc "deploy paas $PLATFORM/$STRATEGY" --argjson payload "$payload" \
+            '{ref:$sha, environment:$env, task:"deploy", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:$desc}' \
+            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+          gh api -X POST "repos/$REPO/deployments/$dep_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          echo "deployment-id=$dep_id" >> "$GITHUB_OUTPUT"
+          echo "previous-version=$prev" >> "$GITHUB_OUTPUT"
+          echo "previous-artifact-ref=$prev_ref" >> "$GITHUB_OUTPUT"
+
+      # ---------- Azure App Service ----------
+      - name: "App Service: desplegar imagen (rolling)"
+        id: as-rolling
+        if: inputs.platform == 'azure-app-service' && inputs.strategy == 'rolling'
+        run: |
+          set -euo pipefail
+          reg=()
+          if [[ "$ARTIFACT_REF" == ghcr.io/* ]]; then reg=(--container-registry-url https://ghcr.io); fi
+          az webapp config container set --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" \
+            --container-image-name "$ARTIFACT_REF" "${reg[@]}" --only-show-errors
+
+      - name: "App Service: desplegar imagen en el slot de staging (blue-green y canary)"
+        id: as-slot
+        if: inputs.platform == 'azure-app-service' && inputs.strategy != 'rolling'
+        run: |
+          set -euo pipefail
+          reg=()
+          if [[ "$ARTIFACT_REF" == ghcr.io/* ]]; then reg=(--container-registry-url https://ghcr.io); fi
+          az webapp config container set --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" --slot "$SLOT" \
+            --container-image-name "$ARTIFACT_REF" "${reg[@]}" --only-show-errors
+
+      - name: "App Service: swap a producción (blue-green)"
+        id: swap
+        if: inputs.platform == 'azure-app-service' && inputs.strategy == 'blue-green'
+        run: |
+          set -euo pipefail
+          az webapp deployment slot swap --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" \
+            --slot "$SLOT" --target-slot production
+
+      - name: "App Service: canary con tráfico dividido"
+        id: canary-as
+        if: inputs.platform == 'azure-app-service' && inputs.strategy == 'canary'
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra STEPS <<< "$CANARY_STEPS"
+          for s in "${STEPS[@]}"; do
+            if [ "$s" -eq 100 ]; then break; fi
+            az webapp traffic-routing set --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" --distribution "$SLOT=$s" --only-show-errors
+            echo "Canary al $s% en el slot $SLOT"
+            sleep "$CANARY_PAUSE"
+            if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "::error::health-check fallido con el canary al $s%"; exit 1
+            fi
+          done
+
+      - name: "App Service: swap final tras el canary"
+        id: swapc
+        if: inputs.platform == 'azure-app-service' && inputs.strategy == 'canary'
+        run: |
+          set -euo pipefail
+          az webapp traffic-routing clear --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" --only-show-errors
+          az webapp deployment slot swap --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" \
+            --slot "$SLOT" --target-slot production
+
+      # ---------- Google Cloud Run ----------
+      - name: "Cloud Run: desplegar revisión nueva sin tráfico"
+        id: cr-deploy
+        if: inputs.platform == 'cloud-run'
+        run: |
+          set -euo pipefail
+          old=$(gcloud run services describe "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+                --format='value(status.latestReadyRevisionName)' 2>/dev/null || true)
+          gcloud run deploy "$APP" --image "$ARTIFACT_REF" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --no-traffic --quiet
+          new=$(gcloud run services describe "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+                --format='value(status.latestCreatedRevisionName)')
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: "Cloud Run: mover tráfico (rolling o blue-green)"
+        id: cr-shift
+        if: inputs.platform == 'cloud-run' && inputs.strategy != 'canary'
+        env:
+          NEW: ${{ steps.cr-deploy.outputs.new }}
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --to-revisions "$NEW=100" --quiet
+
+      - name: "Cloud Run: canary con tráfico dividido"
+        id: canary-cr
+        if: inputs.platform == 'cloud-run' && inputs.strategy == 'canary'
+        env:
+          NEW: ${{ steps.cr-deploy.outputs.new }}
+          OLD: ${{ steps.cr-deploy.outputs.old }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OLD" ]; then echo "::error::canary requiere una revisión previa"; exit 1; fi
+          IFS=',' read -ra STEPS <<< "$CANARY_STEPS"
+          for s in "${STEPS[@]}"; do
+            if [ "$s" -eq 100 ]; then
+              gcloud run services update-traffic "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+                --to-revisions "$NEW=100" --quiet
+            else
+              gcloud run services update-traffic "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+                --to-revisions "$NEW=$s,$OLD=$((100 - s))" --quiet
+              echo "Canary al $s% en la revisión $NEW"
+              sleep "$CANARY_PAUSE"
+              if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+                echo "::error::health-check fallido con el canary al $s%"; exit 1
+              fi
+            fi
+          done
+
+      # ---------- Comprobación y rollback ----------
+      - name: Comprobar salud (health-check-url)
+        id: health
+        if: inputs.strategy != 'canary'
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "Salud OK (intento $i)"; exit 0
+            fi
+            echo "Sin respuesta (intento $i)"; sleep 15
+          done
+          echo "::error::health-check-url no responde"; exit 1
+
+      - name: Revertir si falla (rollback-on-failure)
+        id: rollback
+        if: ${{ always() && inputs.rollback-on-failure && (steps.health.outcome == 'failure' || steps.canary-as.outcome == 'failure' || steps.canary-cr.outcome == 'failure' || steps.swapc.outcome == 'failure') }}
+        env:
+          PREV_REF: ${{ steps.dep.outputs.previous-artifact-ref }}
+          OLD_REV: ${{ steps.cr-deploy.outputs.old }}
+          SWAPPED: ${{ steps.swap.outcome == 'success' || steps.swapc.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          if [ "$PLATFORM" = "azure-app-service" ]; then
+            if [ "$STRATEGY" = "rolling" ]; then
+              [ -n "$PREV_REF" ] || { echo "::error::sin imagen previa registrada"; exit 1; }
+              az webapp config container set --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" \
+                --container-image-name "$PREV_REF" --only-show-errors
+            else
+              if [ "$STRATEGY" = "canary" ]; then
+                az webapp traffic-routing clear --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" --only-show-errors || true
+              fi
+              if [ "$SWAPPED" = "true" ]; then
+                az webapp deployment slot swap --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" \
+                  --slot "$SLOT" --target-slot production
+              fi
+            fi
+          else
+            [ -n "$OLD_REV" ] || { echo "::error::sin revisión previa"; exit 1; }
+            gcloud run services update-traffic "$APP" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+              --to-revisions "$OLD_REV=100" --quiet
+          fi
+
+      - name: Salidas del despliegue
+        id: out
+        if: success()
+        run: |
+          echo "version-deployed=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$HEALTH_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar resultado en la Deployments API
+        if: always()
+        env:
+          DEP_ID: ${{ steps.dep.outputs.deployment-id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          if [ -z "$DEP_ID" ]; then echo "Sin deployment registrado."; exit 0; fi
+          state=failure
+          if [ "$JOB_STATUS" = "success" ]; then state=success; fi
+          gh api -X POST "repos/$REPO/deployments/$DEP_ID/statuses" -f state="$state" \
+            -f environment="$ENVIRONMENT" -f environment_url="$HEALTH_URL" -f log_url="$RUN_URL" >/dev/null

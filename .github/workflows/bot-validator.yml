@@ -1,0 +1,232 @@
+# Validador de PR (GitHub App devsecops-validator). Workflow reutilizable.
+#
+# Contratos (PLAN.md, secciones 2.1 y 2.8):
+#   - Checks requeridos: "Validation / conventions" y "Validation / workflows-and-iac".
+#     El nombre de un check de workflow reutilizable es "<job del caller> / <job del workflow>",
+#     así que el caller debe tener un job llamado "Validation" (ver README.md).
+#   - Comentario de resumen con marcador <!-- validator --> (único, actualizable).
+#
+# GitHub exige que los workflows reutilizables estén en .github/workflows/ del repo que los
+# publica. Este fichero debe copiarse (o referenciarse desde un wrapper) allí; ver README.md.
+#
+# Seguridad: el código del PR se descarga solo para leerlo (sin ejecutarlo). Las herramientas
+# (actionlint, hadolint) se instalan desde su release con SHA256 fijado. Las acciones de terceros
+# están fijadas por SHA completo.
+
+name: Validation
+
+on:
+  workflow_call:
+    inputs:
+      validator-repository:
+        description: 'owner/repo que contiene bots/validator/. Vacío = repositorio que llama.'
+        type: string
+        required: false
+        default: ''
+      validator-ref:
+        description: 'Ref o SHA de los scripts del validador. Vacío = mismo commit que este workflow.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      app-token:
+        description: 'Token de corta duración de la GitHub App devsecops-validator (opcional). Si no se pasa, se usa GITHUB_TOKEN.'
+        required: false
+
+# Mínimo necesario. El caller no puede conceder más de lo que declare aquí.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  conventions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Descargar scripts del validador
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.validator-repository || github.repository }}
+          ref: ${{ inputs.validator-ref || github.workflow_sha }}
+          token: ${{ secrets.app-token || github.token }}
+          sparse-checkout: bots/validator
+          path: validator
+          persist-credentials: false
+
+      - name: Descargar código del PR (solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: pr
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Ejecutar reglas de convenciones
+        id: run
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.app-token || github.token }}
+        run: |
+          node validator/bots/validator/scripts/validate.mjs \
+            --check conventions \
+            --root pr \
+            --report "$RUNNER_TEMP/report-conventions.md"
+
+      - name: Exportar informe al job de resumen
+        id: export
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/report-conventions.md"
+          if [ -s "$f" ]; then
+            echo "report=$(base64 -w0 < "$f")" >> "$GITHUB_OUTPUT"
+          fi
+
+    outputs:
+      report: ${{ steps.export.outputs.report }}
+
+  workflows-and-iac:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Descargar scripts del validador
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.validator-repository || github.repository }}
+          ref: ${{ inputs.validator-ref || github.workflow_sha }}
+          token: ${{ secrets.app-token || github.token }}
+          sparse-checkout: bots/validator
+          path: validator
+          persist-credentials: false
+
+      - name: Descargar código del PR (solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: pr
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Instalar actionlint y hadolint (versión y SHA256 fijados)
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: '1.7.7'
+          ACTIONLINT_SHA256: '023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757'
+          HADOLINT_VERSION: 'v2.12.0'
+          HADOLINT_SHA256: '56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010'
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"
+          tmp="$(mktemp -d)"
+          mkdir -p "$bin"
+
+          curl -fsSL -o "$tmp/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/actionlint.tar.gz" -C "$bin" actionlint
+
+          curl -fsSL -o "$bin/hadolint" \
+            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-x86_64"
+          echo "${HADOLINT_SHA256}  $bin/hadolint" | sha256sum -c -
+          chmod +x "$bin/hadolint"
+
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Ejecutar reglas de workflows e IaC
+        id: run
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.app-token || github.token }}
+        run: |
+          node validator/bots/validator/scripts/validate.mjs \
+            --check workflows-and-iac \
+            --root pr \
+            --report "$RUNNER_TEMP/report-workflows.md"
+
+      - name: Instalar Terraform (solo para terraform fmt)
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: Comprobar formato de Terraform (terraform fmt -check)
+        shell: bash
+        working-directory: pr
+        run: terraform fmt -check -recursive -diff
+
+      - name: Exportar informe al job de resumen
+        id: export
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/report-workflows.md"
+          if [ -s "$f" ]; then
+            echo "report=$(base64 -w0 < "$f")" >> "$GITHUB_OUTPUT"
+          fi
+
+    outputs:
+      report: ${{ steps.export.outputs.report }}
+
+  # Publica un único comentario con los dos informes. No es requerido; si falla
+  # (p. ej. PR desde fork con token de solo lectura) no afecta al resultado de los checks.
+  summary:
+    if: always() && github.event_name == 'pull_request'
+    needs: [conventions, workflows-and-iac]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - name: Descargar scripts del validador
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.validator-repository || github.repository }}
+          ref: ${{ inputs.validator-ref || github.workflow_sha }}
+          token: ${{ secrets.app-token || github.token }}
+          sparse-checkout: bots/validator
+          path: validator
+          persist-credentials: false
+
+      - name: Decodificar informes
+        shell: bash
+        env:
+          R_CONVENTIONS: ${{ needs.conventions.outputs.report }}
+          R_WORKFLOWS: ${{ needs.workflows-and-iac.outputs.report }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ -n "$R_CONVENTIONS" ]; then
+            printf '%s' "$R_CONVENTIONS" | base64 -d > "$RUNNER_TEMP/out/report-conventions.md"
+          fi
+          if [ -n "$R_WORKFLOWS" ]; then
+            printf '%s' "$R_WORKFLOWS" | base64 -d > "$RUNNER_TEMP/out/report-workflows.md"
+          fi
+
+      # PR desde la misma organizacion: el token del propio run puede comentar.
+      - name: Publicar resumen en el PR
+        if: github.event.pull_request.head.repo.fork == false
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.app-token || github.token }}
+        run: |
+          node validator/bots/validator/scripts/validate.mjs --publish \
+            --report "$RUNNER_TEMP/out/report-conventions.md" \
+            --report "$RUNNER_TEMP/out/report-workflows.md"
+
+      # PR desde fork: el run de pull_request no puede comentar (token de solo lectura).
+      # Se sube un artefacto que recoge un workflow_run (ver workflow-comment.yml) con permisos de escritura.
+      # El artefacto no contiene codigo ejecutable; su contenido se valida en el lado que comenta.
+      - name: Preparar metadatos del PR para el artefacto
+        if: github.event.pull_request.head.repo.fork == true
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '{"number":%s,"head_sha":"%s"}\n' "$PR_NUMBER" "$HEAD_SHA" > "$RUNNER_TEMP/out/pr.json"
+
+      - name: Subir informes para PR desde fork
+        if: github.event.pull_request.head.repo.fork == true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: validator-reports
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+          retention-days: 1

@@ -1,0 +1,349 @@
+# Despliegue serverless a AWS Lambda con OIDC y sin secretos estáticos.
+# Modelo: cada despliegue publica una versión inmutable de la función y mueve un alias.
+#   rolling    -> el alias apunta directamente a la versión nueva (corte inmediato).
+#   blue-green -> la versión nueva se prueba invocándola directamente y después se cambia el alias.
+#   canary     -> el alias reparte tráfico entre la versión previa y la nueva según canary-steps.
+# Documentación: pipelines/deploy/README.md
+# Verificación T-28 (docs oficiales de AWS consultadas 2026-11-13; detalle en docs/validacion/T-28.md):
+#   CONFIRMADO: aws lambda update-alias --routing-config AdditionalVersionWeights (pesos 0.0-1.0; máximo dos versiones;
+#               la versión primaria --function-version recibe el resto), create-alias, get-alias (FunctionVersion),
+#               waiter function-updated-v2 (--function-name, --qualifier), invoke --cli-binary-format raw-in-base64-out.
+#   NO VERIFICADO: campo FunctionError en la salida de invoke; despliegue por CodeDeploy (no usado en este pipeline).
+name: deploy-serverless
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod."
+        required: true
+        type: string
+      version:
+        description: "Versión desplegada (contrato 2.4)."
+        required: true
+        type: string
+      artifact-ref:
+        description: 'Imagen de Lambda por digest (<cuenta>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:<64 hex>) o "artifact:<nombre>" con un .zip subido en la misma ejecución.'
+        required: true
+        type: string
+      strategy:
+        description: "rolling (defecto), blue-green o canary."
+        required: false
+        type: string
+        default: rolling
+      canary-steps:
+        description: "Pesos de tráfico a la versión nueva en %, crecientes y terminados en 100, p. ej. 10,50,100."
+        required: false
+        type: string
+        default: "10,50,100"
+      canary-pause-seconds:
+        description: "Pausa entre pasos del canary, en segundos."
+        required: false
+        type: number
+        default: 300
+      smoke-test-payload:
+        description: "Evento JSON con el que se invoca la versión nueva antes del corte en blue-green."
+        required: false
+        type: string
+        default: "{}"
+      health-check-url:
+        description: "URL pública de la función o del API Gateway que debe responder 2xx tras el corte."
+        required: true
+        type: string
+      rollback-on-failure:
+        description: "Revertir el alias a la versión previa si falla el despliegue o la comprobación de salud."
+        required: false
+        type: boolean
+      app-name:
+        description: "Nombre lógico de la aplicación (para trazas y el deployment)."
+        required: true
+        type: string
+      runner:
+        description: 'Runner en JSON. Por defecto hosted ("ubuntu-latest"); usar un runner self-hosted solo si el despliegue necesita red privada (2.1).'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      deployment-id:
+        description: "ID del deployment en la GitHub Deployments API."
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+      url:
+        description: "URL comprobada tras el despliegue."
+        value: ${{ jobs.deploy.outputs.url }}
+      version-deployed:
+        description: "Versión desplegada con éxito (vacía si falló)."
+        value: ${{ jobs.deploy.outputs.version-deployed }}
+      previous-version:
+        description: "Última versión exitosa anterior en este entorno (para rollback)."
+        value: ${{ jobs.deploy.outputs.previous-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-serverless-${{ inputs.environment }}-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+      packages: read
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      STRATEGY: ${{ inputs.strategy }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      GH_ACTOR: ${{ github.actor }}
+    steps:
+      - name: Exigir rollback-on-failure=true en staging y prod
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLLBACK: ${{ inputs.rollback-on-failure }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENVIRONMENT" =~ ^(staging|prod)$ ]] && [ "$ROLLBACK" != "true" ]; then
+            echo "::error::rollback-on-failure debe ser true en $ENVIRONMENT (recibido: $ROLLBACK)"; exit 1
+          fi
+
+      - name: Validar contrato de entrada
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          case "$STRATEGY" in rolling|blue-green|canary) ;; *) echo "::error::strategy debe ser rolling, blue-green o canary"; exit 1 ;; esac
+          if [[ "$ARTIFACT_REF" == artifact:* ]]; then
+            [ -n "${ARTIFACT_REF#artifact:}" ] || { echo "::error::artifact: sin nombre"; exit 1; }
+          elif ! [[ "$ARTIFACT_REF" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::artifact-ref debe ser una imagen por digest o artifact:<nombre>"; exit 1
+          fi
+          if [ "$STRATEGY" = "canary" ]; then
+            prev=0
+            IFS=',' read -ra W <<< "$CANARY_STEPS"
+            for w in "${W[@]}"; do
+              if ! [[ "$w" =~ ^[0-9]+$ ]] || [ "$w" -le "$prev" ] || [ "$w" -gt 100 ]; then
+                echo "::error::canary-steps inválido: $CANARY_STEPS"; exit 1
+              fi
+              prev=$w
+            done
+            if [ "$prev" -ne 100 ]; then echo "::error::canary-steps debe terminar en 100"; exit 1; fi
+          fi
+
+      - name: Verificar procedencia de la imagen (solo si existe atestación; bloqueante en prod)
+        run: |
+          set -euo pipefail
+          if [[ "$ARTIFACT_REF" != *@sha256:* ]]; then echo "Sin digest de imagen: se omite la verificación de procedencia."; exit 0; fi
+          digest="${ARTIFACT_REF##*@}"
+          count=$(gh api "repos/$REPO/attestations/$digest" --jq '.attestations | length' 2>/dev/null || echo 0)
+          if [ "$count" = "0" ]; then
+            msg="no existe atestación de procedencia para $digest en $REPO (genérala en el build, WS2)"
+            if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"; exit 0
+          fi
+          if [[ "$ARTIFACT_REF" == ghcr.io/* ]]; then echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin; fi
+          if gh attestation verify "oci://$ARTIFACT_REF" --owner "$OWNER"; then exit 0; fi
+          msg="la verificación de procedencia de $digest falló"
+          if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg"
+
+  deploy:
+    needs: validate
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.health-check-url }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+    outputs:
+      deployment-id: ${{ steps.dep.outputs.deployment-id }}
+      previous-version: ${{ steps.dep.outputs.previous-version }}
+      version-deployed: ${{ steps.out.outputs.version-deployed }}
+      url: ${{ steps.out.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      STRATEGY: ${{ inputs.strategy }}
+      HEALTH_URL: ${{ inputs.health-check-url }}
+      ROLLBACK_ON_FAILURE: ${{ inputs.rollback-on-failure }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      CANARY_PAUSE: ${{ inputs.canary-pause-seconds }}
+      SMOKE_PAYLOAD: ${{ inputs.smoke-test-payload }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      FN: ${{ vars.SERVERLESS_STACK_NAME }}
+      ALIAS: ${{ vars.AWS_LAMBDA_ALIAS || 'live' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolver nombre del artefacto
+        id: artifact-name
+        env:
+          REF: ${{ inputs.artifact-ref }}
+        run: echo "name=${REF#artifact:}" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar paquete .zip (solo artifact:)
+        if: ${{ startsWith(inputs.artifact-ref, 'artifact:') }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: ${{ runner.temp }}/pkg
+
+      - name: Login AWS (OIDC, sin secreto)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Calcular versión previa y registrar despliegue
+        id: dep
+        run: |
+          set -euo pipefail
+          prev=""
+          while IFS=$'\t' read -r id payload; do
+            [ -n "$id" ] || continue
+            state=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+            [ "$state" = "success" ] || continue
+            v=$(jq -r '.version // ""' <<< "$payload")
+            if [ -n "$v" ] && [ "$v" != "$VERSION" ]; then prev="$v"; break; fi
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | select((.payload.target // "") == "serverless") | "\(.id)\t\(.payload|tostring)"')
+          payload=$(jq -cn --arg v "$VERSION" --arg r "$ARTIFACT_REF" --arg s "$STRATEGY" \
+            '{version:$v, artifact_ref:$r, target:"serverless", strategy:$s}')
+          digest=""
+          if [[ "$ARTIFACT_REF" == *@sha256:* ]]; then digest="${ARTIFACT_REF##*@}"; fi
+          payload=$(jq -c --arg d "$digest" --arg run "$GITHUB_RUN_ID" '. + {artifact_digest:$d, run_id:$run}' <<< "$payload")
+          dep_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg desc "deploy serverless $STRATEGY" --argjson payload "$payload" \
+            '{ref:$sha, environment:$env, task:"deploy", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:$desc}' \
+            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+          gh api -X POST "repos/$REPO/deployments/$dep_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          echo "deployment-id=$dep_id" >> "$GITHUB_OUTPUT"
+          echo "previous-version=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar versión nueva de la función
+        id: publish
+        run: |
+          set -euo pipefail
+          if [[ "$ARTIFACT_REF" == artifact:* ]]; then
+            zip=$(ls "$RUNNER_TEMP"/pkg/*.zip | head -n 1)
+            src=(--zip-file "fileb://$zip")
+          else
+            src=(--image-uri "$ARTIFACT_REF")
+          fi
+          new=$(aws lambda update-function-code --function-name "$FN" "${src[@]}" --publish --query Version --output text)
+          aws lambda wait function-updated-v2 --function-name "$FN" --qualifier "$new"
+          old=$(aws lambda get-alias --function-name "$FN" --name "$ALIAS" --query FunctionVersion --output text 2>/dev/null || true)
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+
+      - name: Prueba previa a la versión nueva (blue-green)
+        if: inputs.strategy == 'blue-green'
+        env:
+          NEW: ${{ steps.publish.outputs.new }}
+        run: |
+          set -euo pipefail
+          resp=$(aws lambda invoke --function-name "$FN" --qualifier "$NEW" \
+            --cli-binary-format raw-in-base64-out --payload "$SMOKE_PAYLOAD" \
+            "$RUNNER_TEMP/smoke.json")
+          if echo "$resp" | jq -e 'has("FunctionError")' >/dev/null; then
+            echo "::error::la versión $NEW devolvió error en la prueba previa"; cat "$RUNNER_TEMP/smoke.json"; exit 1
+          fi
+          echo "Prueba previa correcta (versión $NEW)."
+
+      - name: Cambiar alias a la versión nueva (rolling o blue-green)
+        id: shift
+        if: inputs.strategy != 'canary'
+        env:
+          NEW: ${{ steps.publish.outputs.new }}
+          OLD: ${{ steps.publish.outputs.old }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OLD" ]; then
+            aws lambda create-alias --function-name "$FN" --name "$ALIAS" --function-version "$NEW"
+          else
+            aws lambda update-alias --function-name "$FN" --name "$ALIAS" --function-version "$NEW" \
+              --routing-config '{"AdditionalVersionWeights":{}}' >/dev/null
+          fi
+
+      - name: Desplegar canary (pesos del alias)
+        id: canary
+        if: inputs.strategy == 'canary'
+        env:
+          NEW: ${{ steps.publish.outputs.new }}
+          OLD: ${{ steps.publish.outputs.old }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OLD" ]; then
+            echo "::error::canary requiere un alias existente con una versión previa"; exit 1
+          fi
+          IFS=',' read -ra STEPS <<< "$CANARY_STEPS"
+          for s in "${STEPS[@]}"; do
+            if [ "$s" -eq 100 ]; then
+              aws lambda update-alias --function-name "$FN" --name "$ALIAS" --function-version "$NEW" \
+                --routing-config '{"AdditionalVersionWeights":{}}' >/dev/null
+            else
+              w=$(awk -v s="$s" 'BEGIN{printf "%.2f", s/100}')
+              aws lambda update-alias --function-name "$FN" --name "$ALIAS" --function-version "$OLD" \
+                --routing-config "{\"AdditionalVersionWeights\":{\"$NEW\":$w}}" >/dev/null
+            fi
+            echo "Canary al $s% en la versión $NEW"
+            sleep "$CANARY_PAUSE"
+            if ! curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "::error::health-check fallido con el canary al $s%"; exit 1
+            fi
+          done
+
+      - name: Comprobar salud (health-check-url)
+        id: health
+        if: inputs.strategy != 'canary'
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 10); do
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "Salud OK (intento $i)"; exit 0
+            fi
+            echo "Sin respuesta (intento $i)"; sleep 10
+          done
+          echo "::error::health-check-url no responde"; exit 1
+
+      - name: Revertir alias a la versión previa (rollback-on-failure)
+        id: rollback
+        if: ${{ always() && inputs.rollback-on-failure && (steps.shift.outcome == 'failure' || steps.canary.outcome == 'failure' || steps.health.outcome == 'failure') }}
+        env:
+          OLD: ${{ steps.publish.outputs.old }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OLD" ]; then echo "::error::sin versión previa en el alias"; exit 1; fi
+          aws lambda update-alias --function-name "$FN" --name "$ALIAS" --function-version "$OLD" \
+            --routing-config '{"AdditionalVersionWeights":{}}' >/dev/null
+          echo "Alias $ALIAS devuelto a la versión $OLD"
+
+      - name: Salidas del despliegue
+        id: out
+        if: success()
+        run: |
+          echo "version-deployed=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$HEALTH_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar resultado en la Deployments API
+        if: always()
+        env:
+          DEP_ID: ${{ steps.dep.outputs.deployment-id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          if [ -z "$DEP_ID" ]; then echo "Sin deployment registrado."; exit 0; fi
+          state=failure
+          if [ "$JOB_STATUS" = "success" ]; then state=success; fi
+          gh api -X POST "repos/$REPO/deployments/$DEP_ID/statuses" -f state="$state" \
+            -f environment="$ENVIRONMENT" -f environment_url="$HEALTH_URL" -f log_url="$RUN_URL" >/dev/null

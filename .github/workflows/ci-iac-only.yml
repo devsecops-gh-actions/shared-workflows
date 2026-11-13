@@ -1,0 +1,176 @@
+# ci-iac-only.yml
+# Workflow reutilizable: validacion y empaquetado de IaC sin build de aplicacion.
+# Terraform (fmt, validate, terraform test) y Bicep (build). No hace plan: el plan requiere
+# credenciales de nube por OIDC y pertenece a deploy-vm-iac.yml (WS4). La analisis de seguridad es de WS3 (iac.yml).
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI IaC
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Carpeta con la IaC (Terraform y/o Bicep). Relativa a la raiz del repo.
+        type: string
+        default: '.'
+      matrix:
+        description: Reservado. Este stack no tiene matriz de runtime; se acepta por uniformidad y se ignora.
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` (modulo o despliegue de IaC) o `library` (modulo reutilizable).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar `terraform test` si existe la carpeta tests/ o ficheros *.tftest.hcl.
+        type: boolean
+        default: true
+      publish:
+        description: Aceptado por uniformidad y ignorado en este stack. La publicacion de librerias es de publish-package.yml.
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      version:
+        description: Version semver (2.4).
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido.
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta del bundle de IaC (tar.gz) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      artifact-path: ${{ steps.pkg.outputs.artifact-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar tecnologia de IaC
+        id: detect
+        env:
+          WD: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          tf=$(find "$WD" -name '*.tf' -not -path '*/.terraform/*' | head -n1 || true)
+          bc=$(find "$WD" -name '*.bicep' | head -n1 || true)
+          [ -n "$tf" ] && echo "terraform=true" >> "$GITHUB_OUTPUT" || echo "terraform=false" >> "$GITHUB_OUTPUT"
+          [ -n "$bc" ] && echo "bicep=true" >> "$GITHUB_OUTPUT" || echo "bicep=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$tf" ] && [ -z "$bc" ]; then
+            echo "::error::No se encuentran ficheros *.tf ni *.bicep en '$WD'."
+            exit 1
+          fi
+
+      - name: Configurar Terraform
+        if: ${{ steps.detect.outputs.terraform == 'true' }}
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: Cache de providers de Terraform (clave por .terraform.lock.hcl)
+        if: ${{ steps.detect.outputs.terraform == 'true' }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-tfplugins-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-tfplugins-
+
+      - name: Terraform fmt, init y validate
+        if: ${{ steps.detect.outputs.terraform == 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform fmt -check -recursive
+          # Cada directorio con *.tf se valida por separado (init sin backend: no toca estado remoto).
+          while IFS= read -r dir; do
+            echo "::group::terraform validate $dir"
+            (cd "$dir" && terraform init -backend=false -input=false -lockfile=readonly >/dev/null && terraform validate)
+            echo "::endgroup::"
+          done < <(find . -name '*.tf' -not -path '*/.terraform/*' -exec dirname {} \; | sort -u)
+
+      - name: Terraform test
+        if: ${{ steps.detect.outputs.terraform == 'true' && inputs.run-tests }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          if find . -name '*.tftest.hcl' -not -path '*/.terraform/*' | grep -q .; then
+            while IFS= read -r dir; do
+              (cd "$dir" && terraform init -backend=false -input=false -lockfile=readonly >/dev/null && terraform test)
+            done < <(find . -name '*.tftest.hcl' -not -path '*/.terraform/*' -exec dirname {} \; | sort -u)
+          else
+            echo "::notice::No hay ficheros *.tftest.hcl; terraform test omitido."
+          fi
+
+      - name: Bicep build
+        if: ${{ steps.detect.outputs.bicep == 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          RUNNER_TMP_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          find . -name '*.bicep' -print0 | while IFS= read -r -d '' f; do
+            echo "::group::bicep build $f"
+            az bicep build --file "$f" --outfile "$RUNNER_TMP_DIR/$(echo "$f" | tr '/' '_').json"
+            echo "::endgroup::"
+          done
+
+      - name: Calcular version y nombre de artefacto
+        id: meta
+        env:
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          # Sin manifiesto de version: la version base es 0.0.0 y la fija el tag.
+          base="0.0.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Empaquetar bundle de IaC
+        id: pkg
+        env:
+          WD: ${{ inputs.working-directory }}
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$out"
+          main="$out/$ARTIFACT_NAME.tar.gz"
+          tar -czf "$main" --exclude=.terraform --exclude=.git --exclude=artifacts --exclude='*.tfstate*' -C "$WD" .
+          echo "artifact-path=artifacts/$(basename "$main")" >> "$GITHUB_OUTPUT"
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

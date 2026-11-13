@@ -1,0 +1,180 @@
+# Liquibase - rollback
+# Workflow reutilizable: revierte cambios de Liquibase.
+# - tag: rollback hasta una etiqueta (por defecto la version del release, creada antes del update).
+# - count: revierte los ultimos N changesets (solo postgres).
+# En mongo solo se admite rollback por tag, igual que la libreria Jenkins.
+# Para restaurar datos completos (mongo) o la copia de Ansible/AAP (postgres) usar backup-restore.yml.
+# Aprobaciones: el job usa environment; en prod exige aprobacion y un motivo (reason).
+# Equivalente en la libreria Jenkins: vars/liquibase_rollback.groovy (stages "Rollback? - PRE/PRO"), con input interactivo.
+name: Liquibase - rollback
+
+on:
+  workflow_call:
+    inputs:
+      database:
+        description: "Motor de base de datos: mongo o postgres"
+        type: string
+        required: true
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod"
+        type: string
+        required: true
+      changelog-path:
+        description: "Ruta relativa del changelog dentro del repo"
+        type: string
+        required: true
+      rollback-type:
+        description: "tag (defecto) o count (solo postgres)"
+        type: string
+        required: false
+        default: 'tag'
+      target-tag:
+        description: "Etiqueta destino para rollback tipo tag. Obligatoria con tag"
+        type: string
+        required: false
+        default: ''
+      rollback-count:
+        description: "Numero de changesets a revertir con rollback tipo count"
+        type: string
+        required: false
+        default: '1'
+      reason:
+        description: "Motivo del rollback. Obligatorio en prod; queda en el resumen del job"
+        type: string
+        required: false
+        default: ''
+      runner:
+        description: "Etiquetas del runner en JSON (self-hosted secure-prod por defecto: acceso a la BBDD)"
+        type: string
+        required: false
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liquibase-${{ inputs.database }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: rollback
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      DATABASE: ${{ inputs.database }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      CHANGELOG_PATH: ${{ inputs.changelog-path }}
+      ROLLBACK_TYPE: ${{ inputs.rollback-type }}
+      TARGET_TAG: ${{ inputs.target-tag }}
+      ROLLBACK_COUNT: ${{ inputs.rollback-count }}
+      REASON: ${{ inputs.reason }}
+      DB_SCHEMA: ${{ vars.DB_SCHEMA }}
+      LOG_LEVEL: ${{ vars.LIQUIBASE_LOG_LEVEL }}
+      LIQUIBASE_IMAGE_POSTGRES: ${{ vars.LIQUIBASE_IMAGE_POSTGRES }}
+      LIQUIBASE_IMAGE_MONGO: ${{ vars.LIQUIBASE_IMAGE_MONGO }}
+      LIQUIBASE_COMMAND_URL: ${{ vars.DB_URL }}
+      LIQUIBASE_COMMAND_USERNAME: ${{ secrets.SEC_DB_USERNAME }}
+      LIQUIBASE_COMMAND_PASSWORD: ${{ secrets.SEC_DB_PASSWORD }}
+      LIQUIBASE_COMMAND_CHANGELOG_FILE: ${{ inputs.changelog-path }}
+      LIQUIBASE_SEARCH_PATH: /liquibase/workspace
+    steps:
+      - name: Checkout del repo del caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Comprobar entradas y configuracion
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$DATABASE" in mongo|postgres) ;; *) echo "::error::database debe ser mongo o postgres"; exit 1 ;; esac
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          if [[ ! "$CHANGELOG_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$CHANGELOG_PATH" == *..* ]] || [[ "$CHANGELOG_PATH" == /* ]]; then
+            echo "::error::changelog-path no es una ruta relativa valida"
+            exit 1
+          fi
+          if [ ! -f "$CHANGELOG_PATH" ]; then
+            echo "::error::no existe el changelog $CHANGELOG_PATH"
+            exit 1
+          fi
+          case "$ROLLBACK_TYPE" in
+            tag)
+              if [[ ! "$TARGET_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                echo "::error::target-tag es obligatorio y solo admite letras, numeros, punto, guion y guion bajo"
+                exit 1
+              fi
+              ;;
+            count)
+              if [ "$DATABASE" = mongo ]; then
+                echo "::error::mongo solo admite rollback-type tag"
+                exit 1
+              fi
+              if [[ ! "$ROLLBACK_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::rollback-count debe ser un entero positivo"
+                exit 1
+              fi
+              ;;
+            *) echo "::error::rollback-type debe ser tag o count"; exit 1 ;;
+          esac
+          if [ "$ENVIRONMENT" = prod ] && [ -z "${REASON// /}" ]; then
+            echo "::error::reason es obligatorio para rollback en prod"
+            exit 1
+          fi
+          if [ "$DATABASE" = postgres ]; then
+            [ -n "${LIQUIBASE_IMAGE_POSTGRES:-}" ] || { echo "::error::falta la variable de organizacion LIQUIBASE_IMAGE_POSTGRES"; exit 1; }
+          else
+            [ -n "${LIQUIBASE_IMAGE_MONGO:-}" ] || { echo "::error::falta la variable de organizacion LIQUIBASE_IMAGE_MONGO"; exit 1; }
+          fi
+          [ -n "${LIQUIBASE_COMMAND_URL:-}" ] || { echo "::error::falta la variable DB_URL en el entorno $ENVIRONMENT"; exit 1; }
+          [ -n "${LIQUIBASE_COMMAND_USERNAME:-}" ] || { echo "::error::falta el secreto SEC_DB_USERNAME en el entorno $ENVIRONMENT"; exit 1; }
+          [ -n "${LIQUIBASE_COMMAND_PASSWORD:-}" ] || { echo "::error::falta el secreto SEC_DB_PASSWORD en el entorno $ENVIRONMENT"; exit 1; }
+
+      - name: Liquibase rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_LEVEL="${LOG_LEVEL:-INFO}"
+          EXTRA_ARGS=()
+          if [ "$DATABASE" = postgres ]; then
+            IMAGE="$LIQUIBASE_IMAGE_POSTGRES"
+            if [ -n "$DB_SCHEMA" ]; then
+              EXTRA_ARGS+=("--default-schema-name=$DB_SCHEMA")
+            fi
+          else
+            IMAGE="$LIQUIBASE_IMAGE_MONGO"
+            EXTRA_ARGS+=("--databaseClass=liquibase.ext.mongodb.database.MongoLiquibaseDatabase")
+          fi
+          if [ "$ROLLBACK_TYPE" = count ]; then
+            LIQUIBASE_CMD=(rollbackCount "$ROLLBACK_COUNT")
+          else
+            LIQUIBASE_CMD=(rollback "$TARGET_TAG")
+          fi
+          echo "Rollback ($ROLLBACK_TYPE) en $DATABASE / $ENVIRONMENT"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/liquibase/workspace" \
+            -w /liquibase/workspace \
+            -e LIQUIBASE_COMMAND_URL \
+            -e LIQUIBASE_COMMAND_USERNAME \
+            -e LIQUIBASE_COMMAND_PASSWORD \
+            -e LIQUIBASE_COMMAND_CHANGELOG_FILE \
+            -e LIQUIBASE_SEARCH_PATH \
+            "$IMAGE" "${EXTRA_ARGS[@]}" --log-level="$LOG_LEVEL" "${LIQUIBASE_CMD[@]}"
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Liquibase rollback"
+            echo "- Motor: \`$DATABASE\`"
+            echo "- Entorno: \`$ENVIRONMENT\`"
+            echo "- Tipo: \`$ROLLBACK_TYPE\`"
+            echo "- Destino: \`${TARGET_TAG:-$ROLLBACK_COUNT changesets}\`"
+            echo "- Motivo: ${REASON:-no indicado}"
+            echo "- Commit del caller: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"

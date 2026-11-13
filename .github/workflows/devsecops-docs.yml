@@ -1,0 +1,365 @@
+# devsecops-docs: workflow reutilizable del bot autodocumentador (PLAN.md 2.8 y WS5).
+#
+# Lo invoca un workflow "caller" de cada repo de producto (ver bots/autodoc/README.md).
+# Nombre de check informativo: "<job del caller> / drift" (con job "Docs" en el caller: "Docs / drift").
+#
+# Modos:
+#   drift      pull_request. Solo genera en el árbol de trabajo y avisa si la documentación
+#              está desactualizada. No escribe nada, no usa la App y no bloquea.
+#   main-sync  push a la rama por defecto, schedule o workflow_dispatch. Regenera toda la
+#              documentación y abre/actualiza un PR desde bot/docs/main-sync hacia la rama por defecto.
+#   pr-docs    comando /docs en un PR (issue_comment). Regenera los servicios tocados por el PR y
+#              abre/actualiza un PR desde bot/docs/pr-<n> hacia la rama del PR (nunca escribe en ella).
+#
+# Permisos: el GITHUB_TOKEN es de solo lectura en todos los jobs. Las escrituras las hace
+# el job "publish" con un token de vida corta de la GitHub App devsecops-docs, que solo puede
+# escribir en bot/docs/* (ruleset de ramas bot/*) y abrir PR. Ningún job escribe en main.
+#
+# Seguridad: solo se ejecuta sobre PR del mismo repo (los forks no reciben secretos ni escritura).
+# El generador se descarga del repo de herramientas fijado por SHA y no ejecuta código del repo analizado.
+
+name: Docs
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "drift | main-sync | pr-docs"
+        type: string
+        required: true
+      tool-repository:
+        description: "Repo que contiene bots/autodoc (p. ej. <org>-platform/bots)"
+        type: string
+        required: true
+      tool-ref:
+        description: "SHA completo (40 caracteres) del commit del repo de herramientas"
+        type: string
+        required: true
+      tool-path:
+        description: "Ruta de bots/autodoc dentro del repo de herramientas"
+        type: string
+        required: false
+        default: bots/autodoc
+      app-id:
+        description: "ID numérico de la GitHub App devsecops-docs (variable DEVSECOPS_DOCS_APP_ID del caller)"
+        type: string
+        required: false
+    secrets:
+      app-private-key:
+        description: "Clave privada de la App (SEC_DEVSECOPS_DOCS_PRIVATE_KEY). Solo la usan los modos de escritura."
+        required: false
+
+# Sin permisos por defecto. Cada job declara lo que necesita.
+permissions: {}
+
+# drift se cancela si llega un push nuevo al PR; las escrituras se encolan para no pisarse.
+concurrency:
+  group: devsecops-docs-${{ inputs.mode }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: ${{ inputs.mode == 'drift' }}
+
+jobs:
+  resolve:
+    name: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      checkout-ref: ${{ steps.resolve.outputs.checkout-ref }}
+      pr-base-ref: ${{ steps.resolve.outputs.pr-base-ref }}
+      docs-base: ${{ steps.resolve.outputs.docs-base }}
+      topic: ${{ steps.resolve.outputs.topic }}
+    steps:
+      - name: Validar entradas y decidir si se ejecuta
+        id: resolve
+        env:
+          MODE: ${{ inputs.mode }}
+          TOOL_REF: ${{ inputs.tool-ref }}
+          TOOL_PATH: ${{ inputs.tool-path }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bot:skip-docs') }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+          [[ "$TOOL_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::tool-ref debe ser un SHA completo de 40 caracteres"; exit 1; }
+          [[ "$TOOL_PATH" =~ ^[A-Za-z0-9_./-]+$ && "$TOOL_PATH" != *..* ]] || { echo "::error::tool-path no válido"; exit 1; }
+
+          case "$MODE" in
+            drift)
+              [[ "$EVENT" == "pull_request" ]] || { echo "::error::drift solo se ejecuta en pull_request"; exit 1; }
+              if [[ "$SKIP_LABEL" == "true" ]]; then echo "::notice::PR con bot:skip-docs: se omite."; emit run false; exit 0; fi
+              emit run true; emit checkout-ref ""; emit pr-base-ref "$PR_BASE_REF"; emit docs-base ""; emit topic ""
+              ;;
+            main-sync)
+              if [[ "$REF_NAME" != "$DEFAULT_BRANCH" ]]; then echo "::error::main-sync solo se ejecuta en la rama por defecto ($DEFAULT_BRANCH)"; exit 1; fi
+              emit run true; emit checkout-ref "$DEFAULT_BRANCH"; emit pr-base-ref ""; emit docs-base "$DEFAULT_BRANCH"; emit topic "main-sync"
+              ;;
+            pr-docs)
+              [[ "$EVENT" == "issue_comment" ]] || { echo "::error::pr-docs requiere issue_comment"; exit 1; }
+              case "$COMMENT_ASSOC" in
+                OWNER|MEMBER|COLLABORATOR) ;;
+                *) echo "::notice::/docs ignorado: el autor no tiene permiso de escritura en el repo."; emit run false; exit 0 ;;
+              esac
+              IFS=$'\t' read -r HEAD_REPO HEAD_REF HEAD_SHA BASE_REF STATE LABELS < <(
+                gh api "repos/$REPO/pulls/$PR_NUMBER" \
+                  --jq '[.head.repo.full_name, .head.ref, .head.sha, .base.ref, .state, ([.labels[].name] | join(","))] | @tsv'
+              )
+              [[ -n "${HEAD_SHA:-}" ]] || { echo "::error::No se pudo leer el PR $PR_NUMBER"; exit 1; }
+              if [[ "$STATE" != "open" ]]; then echo "::notice::El PR no está abierto."; emit run false; exit 0; fi
+              if [[ "$HEAD_REPO" != "$REPO" ]]; then echo "::notice::/docs no se ejecuta en PR de forks."; emit run false; exit 0; fi
+              if [[ ",$LABELS," == *",bot:skip-docs,"* ]]; then echo "::notice::PR con bot:skip-docs: se omite."; emit run false; exit 0; fi
+              emit run true; emit checkout-ref "$HEAD_SHA"; emit pr-base-ref "$BASE_REF"; emit docs-base "$HEAD_REF"; emit topic "pr-$PR_NUMBER"
+              ;;
+            *)
+              echo "::error::modo desconocido: $MODE"; exit 1
+              ;;
+          esac
+
+  drift:
+    name: drift
+    needs: resolve
+    if: inputs.mode == 'drift' && needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout del merge del PR (sin credenciales persistentes)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Descargar herramienta fijada por SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.tool-repository }}
+          ref: ${{ inputs.tool-ref }}
+          path: .devsecops-docs-tool
+          persist-credentials: false
+
+      - name: Excluir la herramienta del árbol de git
+        run: echo ".devsecops-docs-tool/" >> .git/info/exclude
+
+      - name: Preparar Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Generar en el árbol de trabajo (no se escribe nada en el repo)
+        env:
+          TOOL_PATH: ${{ inputs.tool-path }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          node ".devsecops-docs-tool/${TOOL_PATH}/scripts/generate-docs.mjs" --mode changed --base "origin/$PR_BASE_REF"
+
+      - name: Detectar drift (informativo, no bloquea)
+        run: |
+          changes=$(git status --porcelain)
+          if [[ -z "$changes" ]]; then
+            echo "Sin drift: la documentación está al día."
+            exit 0
+          fi
+          {
+            echo "### Documentación desactualizada"
+            echo ""
+            echo "Ficheros que cambiarían al regenerar:"
+            echo '```'
+            echo "$changes"
+            echo '```'
+            echo ""
+            echo "Escribe \`/docs\` en el PR para que devsecops-docs abra un PR con la documentación."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Docs drift::Documentación desactualizada. Informativo, no bloquea; ver el resumen del job."
+
+  generate:
+    name: generate
+    needs: resolve
+    if: inputs.mode != 'drift' && needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      has-changes: ${{ steps.collect.outputs.has-changes }}
+      target-sha: ${{ steps.collect.outputs.target-sha }}
+    steps:
+      - name: Checkout de la rama objetivo (sin credenciales persistentes)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.checkout-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Descargar herramienta fijada por SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.tool-repository }}
+          ref: ${{ inputs.tool-ref }}
+          path: .devsecops-docs-tool
+          persist-credentials: false
+
+      - name: Excluir la herramienta del árbol de git
+        run: echo ".devsecops-docs-tool/" >> .git/info/exclude
+
+      - name: Preparar Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Generar documentación
+        env:
+          MODE: ${{ inputs.mode }}
+          TOOL_PATH: ${{ inputs.tool-path }}
+          PR_BASE_REF: ${{ needs.resolve.outputs.pr-base-ref }}
+        run: |
+          set -euo pipefail
+          script=".devsecops-docs-tool/${TOOL_PATH}/scripts/generate-docs.mjs"
+          if [[ "$MODE" == "main-sync" ]]; then
+            node "$script" --mode all
+          else
+            node "$script" --mode changed --base "origin/$PR_BASE_REF"
+          fi
+
+      - name: Recoger cambios en un directorio de artefacto
+        id: collect
+        env:
+          OUT: ${{ runner.temp }}/devsecops-docs-out
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          echo "target-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git add -A
+          git -c core.quotepath=off diff --cached --name-only --diff-filter=ACMR > "$OUT/CHANGED.txt"
+          if [[ ! -s "$OUT/CHANGED.txt" ]]; then
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "Sin cambios de documentación."
+            exit 0
+          fi
+          while IFS= read -r f; do
+            mkdir -p "$OUT/$(dirname "$f")"
+            cp "$f" "$OUT/$f"
+          done < "$OUT/CHANGED.txt"
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          echo "Ficheros generados:"
+          cat "$OUT/CHANGED.txt"
+
+      - name: Subir artefacto de cambios
+        if: steps.collect.outputs.has-changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: devsecops-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/devsecops-docs-out
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: publish
+    needs: [resolve, generate]
+    if: inputs.mode != 'drift' && needs.generate.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Token de vida corta de la App devsecops-docs
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout del SHA generado (con token de la App)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.generate.outputs.target-sha }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: true
+
+      - name: Descargar cambios generados
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: devsecops-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/devsecops-docs-out
+
+      - name: Validar rutas, actualizar bot/docs/* y abrir PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          OUT: ${{ runner.temp }}/devsecops-docs-out
+          TARGET_SHA: ${{ needs.generate.outputs.target-sha }}
+          TOPIC: ${{ needs.resolve.outputs.topic }}
+          DOCS_BASE: ${{ needs.resolve.outputs.docs-base }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          BRANCH="bot/docs/${TOPIC}"
+          [[ "$BRANCH" =~ ^bot/docs/[A-Za-z0-9._-]+$ ]] || { echo "::error::Rama no permitida: $BRANCH"; exit 1; }
+
+          # Solo README.md y docs/api.md de servicios; nada bajo rutas ocultas ni fuera del repo.
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            if ! [[ "$f" =~ ^([A-Za-z0-9_-][A-Za-z0-9._-]*/)*(README\.md|docs/api\.md)$ ]]; then
+              echo "::error::Ruta no permitida en el artefacto: $f"
+              exit 1
+            fi
+          done < "$OUT/CHANGED.txt"
+
+          # Rama existente: si tiene PR abierto se construye encima (fast-forward); si no, se recrea
+          # desde el SHA generado borrándola antes. Nunca se usa force push.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then EXISTS=1; else EXISTS=0; fi
+          OPEN_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [[ "$EXISTS" == "1" && -n "$OPEN_PR" ]]; then
+            git fetch --no-tags --depth=1 origin "$BRANCH"
+            git checkout -B "$BRANCH" FETCH_HEAD
+          else
+            if [[ "$EXISTS" == "1" ]]; then
+              echo "Rama huérfana (sin PR abierto): se borra y se recrea."
+              git push origin --delete "$BRANCH"
+            fi
+            git checkout -B "$BRANCH" "$TARGET_SHA"
+          fi
+
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            mkdir -p "$(dirname "$f")"
+            cp "$OUT/$f" "$f"
+            git add -- "$f"
+          done < "$OUT/CHANGED.txt"
+
+          if git diff --cached --quiet; then
+            echo "La documentación del PR de bot ya está al día."
+            exit 0
+          fi
+
+          git config user.name "devsecops-docs[bot]"
+          git config user.email "devsecops-docs[bot]@users.noreply.github.com"
+          git commit -q -m "docs: actualiza documentación generada" -m "Generada por devsecops-docs a partir de ${TARGET_SHA}."
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+          if [[ -z "$OPEN_PR" ]]; then
+            TITLE="docs: documentación generada (${TOPIC})"
+            BODY="Documentación generada por devsecops-docs a partir de ${TARGET_SHA}. Revisa el diff antes de aprobar. Solo modifica README.md (bloque devsecops-docs) y docs/api.md de los servicios afectados."
+            if ! gh pr create --repo "$REPO" --base "$DOCS_BASE" --head "$BRANCH" --title "$TITLE" --body "$BODY" --label "bot:docs" >/dev/null 2>&1; then
+              echo "::notice::No se pudo aplicar la etiqueta bot:docs; se crea el PR sin ella."
+              gh pr create --repo "$REPO" --base "$DOCS_BASE" --head "$BRANCH" --title "$TITLE" --body "$BODY"
+            fi
+          else
+            echo "PR existente #$OPEN_PR actualizado."
+          fi

@@ -1,0 +1,632 @@
+# Workflow reutilizable: Genesys Cloud (flows y objects) para low-code.
+# Equivalente a Pipeline_Genesys_flows / Genesys_flows.groovy, Pipeline_Genesys_objects / Genesys_objects.groovy,
+# genesys_validate.groovy y genesys_restore.groovy de la librería Jenkins.
+# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/genesys.yml
+# Ver README.md de esta carpeta.
+#
+# Modelo de entornos (Genesys solo tiene org PRE y org PRO; no hay org dev en la librería):
+#   staging -> org PRE (genesys_cloud_pre). Sin aprobación manual (contrato 2.2).
+#   prod    -> org PRO (genesys_cloud_prod). Required reviewers.
+# Origen y destino se eligen con los inputs origin-environment y destination-environment.
+# Cada entorno define: secrets SEC_GENESYS_CLIENT_ID y SEC_GENESYS_CLIENT_SECRET (OAuth client credentials;
+# Genesys Cloud no admite OIDC de GitHub), vars GENESYS_REGION, GENESYS_LOCATION, GENESYS_PROXY (opcional).
+#
+# Aprobaciones en prod (dos como máximo por ejecución):
+#   1. job "plan" (entorno destino): autoriza extraer el estado del destino y generar el plan.
+#   2. job "apply" (entorno destino): aprueba aplicar, con el plan adjunto en la ejecución.
+#   Si el origen es prod (flows, o objects PRO->PRE), job "fetch-origin" añade una aprobación de lectura.
+
+name: lowcode-genesys
+
+on:
+  workflow_call:
+    inputs:
+      technology:
+        description: "genesys-flows o genesys-objects."
+        type: string
+        required: true
+      mode:
+        description: "deploy: flujo completo. rollback: restaura el backup de rollback-run-id y lo vuelve a aplicar."
+        type: string
+        default: "deploy"
+      origin-environment:
+        description: "Nombre del entorno GitHub de origen (lo elige el caller)."
+        type: string
+        required: true
+      origin-approval:
+        description: "true si el entorno de origen tiene required reviewers (usa runner-approval-labels)."
+        type: boolean
+        default: false
+      destination-approval:
+        description: "true si el entorno de destino tiene required reviewers (usa runner-approval-labels)."
+        type: boolean
+        default: false
+      destination-environment:
+        description: "Nombre del entorno GitHub de destino (lo elige el caller)."
+        type: string
+        required: true
+      gc-cli-pip-spec:
+        description: "Especificación pip del CLI gc, con versión exacta (p. ej. nombre==X.Y.Z). Obligatoria. Verificar el paquete antes de usar."
+        type: string
+        required: true
+      terraform-version:
+        description: "Versión exacta de Terraform (solo objects)."
+        type: string
+        default: "1.9.8"
+      param-file:
+        description: "Fichero de parámetros del repo de migración (version, TYPE, IDS_ORIGEN, IDS_DESTINO, ENTIDADES_MIGRACION...)."
+        type: string
+        default: "param.json"
+      allowed-types:
+        description: "Flows: JSON con los TYPE permitidos (genesys.types en Jenkins)."
+        type: string
+        default: '[]'
+      allowed-objects:
+        description: "Objects: JSON con las entidades permitidas (genesys.objects en Jenkins)."
+        type: string
+        default: '[]'
+      rollback-run-id:
+        description: "Solo mode=rollback: id de la ejecución cuyo artefacto genesys-backup se restaura."
+        type: string
+        default: ""
+      runner-labels:
+        description: "Etiquetas JSON del runner para entornos no productivos (staging)."
+        type: string
+        default: '["self-hosted","linux","x64"]'
+      runner-approval-labels:
+        description: "Etiquetas JSON del runner para prod (secure-prod)."
+        type: string
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lowcode-genesys-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Validaciones iniciales (equivale a genesys_validate 'Initial Validations').
+  #    Sin credenciales ni red: solo lee el fichero de parámetros del repo.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validaciones iniciales
+    if: ${{ inputs.mode == 'deploy' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skip-destination: ${{ steps.check.outputs.skip-destination }}
+    env:
+      TECH: ${{ inputs.technology }}
+      PARAM_FILE: ${{ inputs.param-file }}
+      ALLOWED_TYPES: ${{ inputs.allowed-types }}
+      ALLOWED_OBJECTS: ${{ inputs.allowed-objects }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validar parámetros
+        id: check
+        run: |
+          set -euo pipefail
+          case "$TECH" in genesys-flows|genesys-objects) ;; *) echo "::error::technology no soportada: $TECH"; exit 1 ;; esac
+          test -f "$PARAM_FILE" || { echo "::error::No existe $PARAM_FILE"; exit 1; }
+
+          VERSION=$(jq -r '.version // empty' "$PARAM_FILE")
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version inválida en $PARAM_FILE: '$VERSION' (formato NUM.NUM.NUM)"; exit 1
+          fi
+
+          SKIP=false
+          if [ "$TECH" = genesys-flows ]; then
+            TYPE=$(jq -r 'if (.TYPE | type) == "array" then .TYPE[0] else .TYPE end // empty' "$PARAM_FILE")
+            if ! echo "$ALLOWED_TYPES" | jq -e --arg t "$TYPE" 'index($t) != null' >/dev/null; then
+              echo "::error::TYPE no permitido: '$TYPE'"; exit 1
+            fi
+            IDS_ORIGEN=$(jq -r '.IDS_ORIGEN // "" | tostring' "$PARAM_FILE" | sed 's/^ *//; s/ *$//')
+            IDS_DESTINO=$(jq -r '.IDS_DESTINO // "" | tostring' "$PARAM_FILE" | sed 's/^ *//; s/ *$//')
+            # Regla 1 (Jenkins): sin IDS_ORIGEN no puede haber IDS_DESTINO
+            if [ -z "$IDS_ORIGEN" ] && [ -n "$IDS_DESTINO" ]; then
+              echo "::error::IDS_ORIGEN es obligatorio si hay IDS_DESTINO"; exit 1
+            fi
+            # Regla 2 (Jenkins): IDS_ORIGEN sin IDS_DESTINO omite las etapas de destino y rollback
+            if [ -n "$IDS_ORIGEN" ] && [ -z "$IDS_DESTINO" ]; then
+              SKIP=true
+              echo "::notice::IDS_DESTINO vacío: se omiten la extracción del destino y el rollback (como en Jenkins)."
+            fi
+          else
+            ENT=$(jq -c '.ENTIDADES_MIGRACION // []' "$PARAM_FILE")
+            if ! echo "$ENT" | jq -e --argjson allowed "$ALLOWED_OBJECTS" 'all(.[]; . as $e | ($allowed | index($e)) != null)' >/dev/null; then
+              echo "::error::ENTIDADES_MIGRACION contiene entidades no permitidas: $ENT"; exit 1
+            fi
+          fi
+
+          echo "skip-destination=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "Validaciones iniciales OK (version $VERSION, tecnología $TECH)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Extracción del origen (entorno origin-environment). Para flows: gc flows list y verify_objects.py.
+  # ---------------------------------------------------------------------------
+  fetch-origin:
+    name: Extraer origen
+    needs: validate
+    if: ${{ inputs.mode == 'deploy' }}
+    runs-on: ${{ fromJSON(inputs.origin-approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ inputs.origin-environment }}
+    permissions:
+      contents: read
+    env:
+      TECH: ${{ inputs.technology }}
+      PARAM_FILE: ${{ inputs.param-file }}
+      GC_SPEC: ${{ inputs.gc-cli-pip-spec }}
+      TF_VERSION: ${{ inputs.terraform-version }}
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      GENESYSCLOUD_LOCATION: ${{ vars.GENESYS_LOCATION }}
+      HTTP_PROXY: ${{ vars.GENESYS_PROXY }}
+      HTTPS_PROXY: ${{ vars.GENESYS_PROXY }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      TF_VAR_GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      TF_CLI_ARGS: "-no-color"
+      GENESYSCLOUD_RETRY_WAIT_MIN: "2"
+      GENESYSCLOUD_RETRY_WAIT_MAX: "30"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar gc y Terraform
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user "$GC_SPEC"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Instalar Terraform (solo objects)
+        if: inputs.technology == 'genesys-objects'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Extraer origen (flows)
+        if: inputs.technology == 'genesys-flows'
+        run: |
+          set -euo pipefail
+          (cd 1_Origen/Python && python3 plataform-validate.py)
+          TYPE=$(jq -r 'if (.TYPE | type) == "array" then .TYPE[0] else .TYPE end // empty' "$PARAM_FILE")
+          IDS=$(jq -r '.IDS_ORIGEN // "" | tostring' "$PARAM_FILE")
+          mkdir -p Archi/origen && cd Archi
+          if [ "$TYPE" != "all" ]; then VARTYPE=(--varType "$TYPE"); else VARTYPE=(); fi
+          gc flows list -a "${VARTYPE[@]}" --id "$IDS" --filtercondition "active==true" \
+            --transform archy_export_all_tmpl --clientid "$GENESYSCLOUD_OAUTHCLIENT_ID" \
+            --clientsecret "$GENESYSCLOUD_OAUTHCLIENT_SECRET" --environment "$GENESYSCLOUD_REGION" \
+            > export_architect_flows.sh
+          chmod +x export_architect_flows.sh
+          ARCHY_OUTPUT_DIR="$GITHUB_WORKSPACE/Archi/origen" ./export_architect_flows.sh
+          python3 verify_objects.py
+
+      - name: Extraer origen (objects)
+        if: inputs.technology == 'genesys-objects'
+        run: |
+          set -euo pipefail
+          (cd 1_Origen/Python && python3 plataform-validate.py)
+          (cd 1_Origen/Export && terraform init && terraform apply -parallelism=1 -auto-approve)
+          (cd 1_Origen/Python && python3 export.py && python3 rename_IDs.py)
+
+      - name: Publicar origen
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: genesys-origin
+          path: |
+            1_Origen/
+            Archi/
+          if-no-files-found: ignore
+          retention-days: 2
+
+  # ---------------------------------------------------------------------------
+  # 3. Plan (entorno destino): extrae el destino, genera el backup de rollback y el plan.
+  #    Equivale a 'Destination Fetch...', 'Apply changes' (plan) y el plan de 'Rollback?'.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Extraer destino y plan (aprobación 1 si el destino exige aprobación)
+    needs: [validate, fetch-origin]
+    if: ${{ always() && inputs.mode == 'deploy' && needs.validate.result == 'success' && needs.fetch-origin.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.destination-approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ inputs.destination-environment }}
+    permissions:
+      contents: read
+    env:
+      TECH: ${{ inputs.technology }}
+      PARAM_FILE: ${{ inputs.param-file }}
+      SKIP_DESTINATION: ${{ needs.validate.outputs.skip-destination }}
+      GC_SPEC: ${{ inputs.gc-cli-pip-spec }}
+      TF_VERSION: ${{ inputs.terraform-version }}
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      GENESYSCLOUD_LOCATION: ${{ vars.GENESYS_LOCATION }}
+      HTTP_PROXY: ${{ vars.GENESYS_PROXY }}
+      HTTPS_PROXY: ${{ vars.GENESYS_PROXY }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      TF_VAR_GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      TF_CLI_ARGS: "-no-color"
+      GENESYSCLOUD_RETRY_WAIT_MIN: "2"
+      GENESYSCLOUD_RETRY_WAIT_MAX: "30"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Descargar origen extraído
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: genesys-origin
+          path: .
+
+      - name: Instalar gc y Terraform
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user "$GC_SPEC"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Instalar Terraform (solo objects)
+        if: inputs.technology == 'genesys-objects'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Extraer destino (flows, si hay IDS_DESTINO)
+        if: inputs.technology == 'genesys-flows' && needs.validate.outputs.skip-destination == 'false'
+        run: |
+          set -euo pipefail
+          (cd 2_Destino/Python && python3 plataform-validate.py && python3 mover_export.py)
+          (cd 2_Destino/Export && terraform init && terraform apply -parallelism=1 -auto-approve)
+          (cd 2_Destino/Python && python3 export.py && python3 rename_IDs.py)
+          TYPE=$(jq -r 'if (.TYPE | type) == "array" then .TYPE[0] else .TYPE end // empty' "$PARAM_FILE")
+          IDS=$(jq -r '.IDS_DESTINO // "" | tostring' "$PARAM_FILE")
+          mkdir -p Archi/destino && cd Archi
+          if [ "$TYPE" != "all" ]; then VARTYPE=(--varType "$TYPE"); else VARTYPE=(); fi
+          gc flows list -a "${VARTYPE[@]}" --id "$IDS" --filtercondition "active==true" \
+            --transform archy_export_all_tmpl --clientid "$GENESYSCLOUD_OAUTHCLIENT_ID" \
+            --clientsecret "$GENESYSCLOUD_OAUTHCLIENT_SECRET" --environment "$GENESYSCLOUD_REGION" \
+            > export_architect_flows_destino.sh
+          chmod +x export_architect_flows_destino.sh
+          ARCHY_OUTPUT_DIR="$GITHUB_WORKSPACE/Archi/destino" ./export_architect_flows_destino.sh
+          python3 verify_objects.py
+
+      - name: Extraer destino (objects, si hay IDS_DESTINO)
+        if: inputs.technology == 'genesys-objects' && needs.validate.outputs.skip-destination == 'false'
+        run: |
+          set -euo pipefail
+          (cd 2_Destino/Python && python3 plataform-validate.py && python3 mover_export.py)
+          (cd 2_Destino/Export && terraform init && terraform apply -parallelism=1 -auto-approve)
+          (cd 2_Destino/Python && python3 export.py && python3 rename_IDs.py && python3 mover_modules.py && python3 tfstatesconcat.py)
+
+      - name: Generar backup de rollback (estado previo al cambio)
+        run: |
+          set -euo pipefail
+          mkdir -p backup
+          tar --exclude=./.git --exclude=./backup -czf backup/genesys-backup.tgz .
+
+      - name: Publicar backup de rollback
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: genesys-backup
+          path: backup/genesys-backup.tgz
+          retention-days: 30
+
+      - name: Generar plan (flows)
+        if: inputs.technology == 'genesys-flows'
+        run: |
+          set -euo pipefail
+          cd Archi
+          chmod +x list_yaml.sh
+          WS="$GITHUB_WORKSPACE"
+          ARCHY_OUTPUT_DIR="$WS/Archi/origen" ARCHY_DIR="$WS/Archi" ARCHY_PLAN=archiplan.txt ./list_yaml.sh
+          {
+            echo "### Plan de cambios (flows)"
+            echo '```'
+            head -n 200 archiplan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generar plan (objects)
+        if: inputs.technology == 'genesys-objects'
+        run: |
+          set -uo pipefail
+          cd 2_Destino/modules/terraform
+          terraform init
+          terraform plan -detailed-exitcode -out=tfplan.out | tee tfplan.txt
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -eq 1 ]; then
+            echo "::error::terraform plan con errores. No se continúa."
+            exit 1
+          fi
+          {
+            echo "### Plan de cambios (objects, rc=$RC: 0 sin cambios, 2 con cambios)"
+            echo '```'
+            grep -E 'Plan:|No changes' tfplan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar workspace con el plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-plan
+          path: |
+            ./**
+            !./.git/**
+            !./backup/**
+          include-hidden-files: true
+          retention-days: 2
+
+  # ---------------------------------------------------------------------------
+  # 4. Apply (entorno destino): aprobación 2 si prod. Aplica el plan y ejecuta la validación final.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Aplicar cambios (aprobación 2 si el destino exige aprobación)
+    needs: [validate, plan]
+    if: ${{ always() && inputs.mode == 'deploy' && needs.plan.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.destination-approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ inputs.destination-environment }}
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      TECH: ${{ inputs.technology }}
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      GENESYSCLOUD_LOCATION: ${{ vars.GENESYS_LOCATION }}
+      HTTP_PROXY: ${{ vars.GENESYS_PROXY }}
+      HTTPS_PROXY: ${{ vars.GENESYS_PROXY }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      TF_VAR_GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      TF_CLI_ARGS: "-no-color"
+    steps:
+      - name: Descargar workspace con el plan
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: workspace-plan
+          path: .
+
+      - name: Instalar gc y Terraform
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user "$GC_SPEC"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        env:
+          GC_SPEC: ${{ inputs.gc-cli-pip-spec }}
+
+      - name: Instalar Terraform (solo objects)
+        if: inputs.technology == 'genesys-objects'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Aplicar plan (flows)
+        if: inputs.technology == 'genesys-flows'
+        run: |
+          set -euo pipefail
+          cd Archi
+          chmod +x publish.sh
+          ./publish.sh
+
+      - name: Aplicar plan (objects)
+        if: inputs.technology == 'genesys-objects'
+        run: |
+          set -euo pipefail
+          cd 2_Destino/modules/terraform
+          terraform apply -auto-approve tfplan.out
+
+      - name: Validación final del destino
+        run: |
+          set -euo pipefail
+          cd 2_Destino/Python && python3 plataform-validate.py
+
+  # ---------------------------------------------------------------------------
+  # 5. Incremento de versión tras aplicar (equivale a genesys_validate 'Apply changes').
+  #    Escribe en la rama de la ejecución: requiere que el ruleset permita al GITHUB_TOKEN
+  #    (o a una App de bot) hacer push en esa rama. Ver README, sección "Pendientes".
+  # ---------------------------------------------------------------------------
+  bump-version:
+    name: Incrementar versión en param.json
+    needs: [validate, apply]
+    if: ${{ always() && inputs.mode == 'deploy' && needs.apply.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PARAM_FILE: ${{ inputs.param-file }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout de la rama
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+
+      - name: Calcular nueva versión y hacer commit
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version' "$PARAM_FILE")
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          PATCH=$((PATCH + 1))
+          if [ "$PATCH" -gt 99 ]; then
+            PATCH=0; MINOR=$((MINOR + 1))
+            if [ "$MINOR" -gt 99 ]; then MINOR=0; MAJOR=$((MAJOR + 1)); fi
+          fi
+          NEW="$MAJOR.$MINOR.$PATCH"
+          sed -i -E "s/\"version\":[[:space:]]*\"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$NEW\"/" "$PARAM_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$PARAM_FILE"
+          git commit -m "Increase version to $NEW"
+          git push origin "HEAD:refs/heads/$REF_NAME"
+          echo "Versión: $VERSION -> $NEW" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 6. Rollback: restaura el backup de otra ejecución y lo vuelve a aplicar.
+  #    Se lanza con mode=rollback y rollback-run-id. Mismas aprobaciones del entorno destino.
+  # ---------------------------------------------------------------------------
+  rollback-plan:
+    name: "Rollback - restaurar backup y plan (aprobación 1 si el destino exige aprobación)"
+    if: ${{ inputs.mode == 'rollback' }}
+    runs-on: ${{ fromJSON(inputs.destination-approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ inputs.destination-environment }}
+    permissions:
+      contents: read
+      actions: read
+    env:
+      TECH: ${{ inputs.technology }}
+      RUN_ID: ${{ inputs.rollback-run-id }}
+      GC_SPEC: ${{ inputs.gc-cli-pip-spec }}
+      TF_VERSION: ${{ inputs.terraform-version }}
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      GENESYSCLOUD_LOCATION: ${{ vars.GENESYS_LOCATION }}
+      HTTP_PROXY: ${{ vars.GENESYS_PROXY }}
+      HTTPS_PROXY: ${{ vars.GENESYS_PROXY }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      TF_VAR_GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      TF_CLI_ARGS: "-no-color"
+    steps:
+      - name: Comprobar run de origen del backup
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::rollback-run-id es obligatorio en mode=rollback"; exit 1
+          fi
+
+      - name: Descargar backup de la ejecución indicada
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: genesys-backup
+          path: backup-in
+          run-id: ${{ inputs.rollback-run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Restaurar backup (equivale a genesys_restore)
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name backup-in -exec rm -rf {} +
+          tar -xzf backup-in/genesys-backup.tgz -C .
+          if [ "$TECH" = genesys-objects ]; then
+            python3 2_Destino/Python/localswap.py
+          fi
+
+      - name: Instalar gc y Terraform
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user "$GC_SPEC"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Instalar Terraform (solo objects)
+        if: inputs.technology == 'genesys-objects'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Plan de rollback (flows)
+        if: inputs.technology == 'genesys-flows'
+        run: |
+          set -euo pipefail
+          cd Archi
+          chmod +x list_yaml.sh
+          WS="$GITHUB_WORKSPACE"
+          ARCHY_OUTPUT_DIR="$WS/Archi/destino" ARCHY_DIR="$WS/Archi" ARCHY_PLAN=archiplan_rollback.txt ./list_yaml.sh
+          {
+            echo "### Plan de rollback (flows)"
+            echo '```'
+            head -n 200 archiplan_rollback.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Plan de rollback (objects)
+        if: inputs.technology == 'genesys-objects'
+        run: |
+          set -euo pipefail
+          cd 2_Destino/modules/terraform
+          terraform init
+          terraform plan -out=tfplan_rollback.out | tee tfplan_rollback.txt
+
+      - name: Publicar workspace de rollback
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-rollback
+          path: |
+            ./**
+            !./.git/**
+            !./backup-in/**
+          include-hidden-files: true
+          retention-days: 2
+
+  rollback-apply:
+    name: "Rollback - aplicar (aprobación 2 si el destino exige aprobación)"
+    needs: rollback-plan
+    if: ${{ always() && inputs.mode == 'rollback' && needs.rollback-plan.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.destination-approval && inputs.runner-approval-labels || inputs.runner-labels) }}
+    environment: ${{ inputs.destination-environment }}
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      TECH: ${{ inputs.technology }}
+      GC_SPEC: ${{ inputs.gc-cli-pip-spec }}
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      GENESYSCLOUD_LOCATION: ${{ vars.GENESYS_LOCATION }}
+      HTTP_PROXY: ${{ vars.GENESYS_PROXY }}
+      HTTPS_PROXY: ${{ vars.GENESYS_PROXY }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.SEC_GENESYS_CLIENT_ID }}
+      TF_VAR_GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.SEC_GENESYS_CLIENT_SECRET }}
+      TF_VAR_GENESYSCLOUD_REGION: ${{ vars.GENESYS_REGION }}
+      TF_CLI_ARGS: "-no-color"
+    steps:
+      - name: Descargar workspace de rollback
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: workspace-rollback
+          path: .
+
+      - name: Instalar Terraform (solo objects)
+        if: inputs.technology == 'genesys-objects'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Aplicar rollback (flows)
+        if: inputs.technology == 'genesys-flows'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user "$GC_SPEC" || true
+          cd Archi && chmod +x publish.sh && ./publish.sh
+
+      - name: Aplicar rollback (objects)
+        if: inputs.technology == 'genesys-objects'
+        run: |
+          set -euo pipefail
+          cd 2_Destino/modules/terraform
+          terraform apply -auto-approve tfplan_rollback.out
+
+      - name: Validación final del destino
+        run: |
+          set -euo pipefail
+          cd 2_Destino/Python && python3 plataform-validate.py

@@ -1,0 +1,248 @@
+# Liquibase - release a prod (un unico job, una unica aprobacion)
+# Ejecuta en orden, dentro de un solo job con environment: prod: validate -> tag -> backup -> update.
+# Asi cada despliegue a prod pide UNA aprobacion, no una por operacion.
+# Los secretos y variables de prod se leen del entorno del job; el entorno es fijo (no es input).
+# Logica equivalente a liquibase-validate.yml, liquibase-tag.yml, backup-restore.yml (backup) y liquibase-update.yml.
+# El rollback en prod sigue siendo un workflow aparte (liquibase-rollback.yml), con su propia aprobacion.
+name: Liquibase - release a prod
+
+on:
+  workflow_call:
+    inputs:
+      database:
+        description: "Motor de base de datos: mongo o postgres"
+        type: string
+        required: true
+      changelog-path:
+        description: "Ruta relativa del changelog dentro del repo"
+        type: string
+        required: true
+      version:
+        description: "Version semver X.Y.Z; nombre de la etiqueta y de la copia"
+        type: string
+        required: true
+      contexts:
+        description: "Contextos de Liquibase (solo postgres). Vacio = todos"
+        type: string
+        required: false
+        default: ''
+      labels:
+        description: "Etiquetas de Liquibase (solo postgres). Vacio = todas"
+        type: string
+        required: false
+        default: ''
+      retention-days:
+        description: "Dias de retencion del artifact de la copia (mongo). Maximo 90"
+        type: number
+        required: false
+        default: 90
+      runner:
+        description: "Etiquetas del runner en JSON (self-hosted secure-prod: acceso a la BBDD)"
+        type: string
+        required: false
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liquibase-${{ inputs.database }}-prod
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release-prod
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    # Unica aprobacion de prod para todo el release (required reviewers, prevent self-review)
+    environment: prod
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      deployments: write   # un unico registro de despliegue en la Deployments API
+    env:
+      DATABASE: ${{ inputs.database }}
+      ENVIRONMENT: prod
+      CHANGELOG_PATH: ${{ inputs.changelog-path }}
+      VERSION: ${{ inputs.version }}
+      CONTEXTS: ${{ inputs.contexts }}
+      LABELS: ${{ inputs.labels }}
+      RETENTION_DAYS: ${{ inputs.retention-days || 90 }}
+      DB_SCHEMA: ${{ vars.DB_SCHEMA }}
+      DB_PORT: ${{ vars.DB_PORT }}
+      DB_URL: ${{ vars.DB_URL }}
+      DB_CREATE_PROCEDURE: ${{ vars.DB_CREATE_PROCEDURE }}
+      DB_TABLE_EXPORT_RESTORE: ${{ vars.DB_TABLE_EXPORT_RESTORE }}
+      LOG_LEVEL: ${{ vars.LIQUIBASE_LOG_LEVEL }}
+      LIQUIBASE_IMAGE_POSTGRES: ${{ vars.LIQUIBASE_IMAGE_POSTGRES }}
+      LIQUIBASE_IMAGE_MONGO: ${{ vars.LIQUIBASE_IMAGE_MONGO }}
+      MONGO_TOOLS_IMAGE: ${{ vars.MONGO_TOOLS_IMAGE }}
+      AAP_URL: ${{ vars.AAP_URL }}
+      AAP_TEMPLATE_BACKUP_ID: ${{ vars.AAP_TEMPLATE_BACKUP_ID }}
+      AAP_TOKEN: ${{ secrets.SEC_AAP_TOKEN }}
+      # Liquibase lee la conexion de LIQUIBASE_COMMAND_*: la contrasena no va en la linea de comandos
+      LIQUIBASE_COMMAND_URL: ${{ vars.DB_URL }}
+      LIQUIBASE_COMMAND_USERNAME: ${{ secrets.SEC_DB_USERNAME }}
+      LIQUIBASE_COMMAND_PASSWORD: ${{ secrets.SEC_DB_PASSWORD }}
+      LIQUIBASE_COMMAND_CHANGELOG_FILE: ${{ inputs.changelog-path }}
+      LIQUIBASE_SEARCH_PATH: /liquibase/workspace
+      DB_USERNAME: ${{ secrets.SEC_DB_USERNAME }}
+      DB_PASSWORD: ${{ secrets.SEC_DB_PASSWORD }}
+    steps:
+      - name: Checkout del repo del caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Comprobar entradas y configuracion
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$DATABASE" in mongo|postgres) ;; *) echo "::error::database debe ser mongo o postgres"; exit 1 ;; esac
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::version debe tener formato X.Y.Z"; exit 1; fi
+          if [[ ! "$CHANGELOG_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$CHANGELOG_PATH" == *..* ]] || [[ "$CHANGELOG_PATH" == /* ]]; then
+            echo "::error::changelog-path no es una ruta relativa valida"; exit 1
+          fi
+          if [ ! -f "$CHANGELOG_PATH" ]; then echo "::error::no existe el changelog $CHANGELOG_PATH"; exit 1; fi
+          if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || [ "$RETENTION_DAYS" -gt 90 ]; then echo "::error::retention-days debe estar entre 0 y 90"; exit 1; fi
+          [ -n "${LIQUIBASE_COMMAND_URL:-}" ] || { echo "::error::falta la variable DB_URL en el entorno prod"; exit 1; }
+          [ -n "${LIQUIBASE_COMMAND_USERNAME:-}" ] || { echo "::error::falta el secreto SEC_DB_USERNAME en el entorno prod"; exit 1; }
+          [ -n "${LIQUIBASE_COMMAND_PASSWORD:-}" ] || { echo "::error::falta el secreto SEC_DB_PASSWORD en el entorno prod"; exit 1; }
+          if [ "$DATABASE" = postgres ]; then
+            [ -n "${LIQUIBASE_IMAGE_POSTGRES:-}" ] || { echo "::error::falta la variable LIQUIBASE_IMAGE_POSTGRES"; exit 1; }
+            [ -n "${AAP_URL:-}" ] || { echo "::error::falta la variable AAP_URL en el entorno prod"; exit 1; }
+            [ -n "${AAP_TEMPLATE_BACKUP_ID:-}" ] || { echo "::error::falta la variable AAP_TEMPLATE_BACKUP_ID en el entorno prod"; exit 1; }
+            [ -n "${AAP_TOKEN:-}" ] || { echo "::error::falta el secreto SEC_AAP_TOKEN en el entorno prod"; exit 1; }
+          else
+            [ -n "${LIQUIBASE_IMAGE_MONGO:-}" ] || { echo "::error::falta la variable LIQUIBASE_IMAGE_MONGO"; exit 1; }
+            [ -n "${MONGO_TOOLS_IMAGE:-}" ] || { echo "::error::falta la variable MONGO_TOOLS_IMAGE"; exit 1; }
+          fi
+
+      - name: 1. Liquibase validate (prod)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_LEVEL="${LOG_LEVEL:-INFO}"
+          EXTRA_ARGS=()
+          if [ "$DATABASE" = postgres ]; then
+            IMAGE="$LIQUIBASE_IMAGE_POSTGRES"
+            if [ -n "$DB_SCHEMA" ]; then EXTRA_ARGS+=("--default-schema-name=$DB_SCHEMA"); fi
+          else
+            IMAGE="$LIQUIBASE_IMAGE_MONGO"
+            EXTRA_ARGS+=("--databaseClass=liquibase.ext.mongodb.database.MongoLiquibaseDatabase")
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/liquibase/workspace" -w /liquibase/workspace \
+            -e LIQUIBASE_COMMAND_URL -e LIQUIBASE_COMMAND_USERNAME -e LIQUIBASE_COMMAND_PASSWORD \
+            -e LIQUIBASE_COMMAND_CHANGELOG_FILE -e LIQUIBASE_SEARCH_PATH \
+            "$IMAGE" "${EXTRA_ARGS[@]}" --log-level="$LOG_LEVEL" validate
+
+      - name: 2. Liquibase tag (prod)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_LEVEL="${LOG_LEVEL:-INFO}"
+          EXTRA_ARGS=()
+          if [ "$DATABASE" = postgres ]; then
+            IMAGE="$LIQUIBASE_IMAGE_POSTGRES"
+            if [ -n "$DB_SCHEMA" ]; then EXTRA_ARGS+=("--default-schema-name=$DB_SCHEMA"); fi
+          else
+            IMAGE="$LIQUIBASE_IMAGE_MONGO"
+            EXTRA_ARGS+=("--databaseClass=liquibase.ext.mongodb.database.MongoLiquibaseDatabase")
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/liquibase/workspace" -w /liquibase/workspace \
+            -e LIQUIBASE_COMMAND_URL -e LIQUIBASE_COMMAND_USERNAME -e LIQUIBASE_COMMAND_PASSWORD \
+            -e LIQUIBASE_COMMAND_CHANGELOG_FILE -e LIQUIBASE_SEARCH_PATH \
+            "$IMAGE" "${EXTRA_ARGS[@]}" --log-level="$LOG_LEVEL" tag "$VERSION"
+
+      - name: 3. Backup MongoDB (mongodump)
+        id: mongo
+        if: ${{ inputs.database == 'mongo' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="backup-mongo-prod-${VERSION}-$(date -u +%Y%m%dT%H%M%SZ)"
+          OUT="$RUNNER_TEMP/backup"
+          mkdir -p "$OUT"
+          docker run --rm -v "$OUT:/out" "$MONGO_TOOLS_IMAGE" \
+            mongodump --uri "$DB_URL" --username "$DB_USERNAME" --password "$DB_PASSWORD" \
+            --gzip --archive="/out/$NAME.archive.gz"
+          (cd "$OUT" && sha256sum "$NAME.archive.gz" > "$NAME.sha256")
+          echo "backup-name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 3. Subir copia MongoDB como artifact
+        if: ${{ inputs.database == 'mongo' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.mongo.outputs.backup-name }}
+          path: ${{ runner.temp }}/backup/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days || 90 }}
+
+      - name: 3. Backup PostgreSQL (job AAP)
+        id: aap
+        if: ${{ inputs.database == 'postgres' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api() { # $1 metodo, $2 ruta, $3 fichero JSON opcional. El token va por stdin
+            local args=(-sS -X "$1" -H "Content-Type: application/json" -K -)
+            if [ -n "${3:-}" ]; then args+=(--data "@$3"); fi
+            printf 'header = "Authorization: Bearer %s"\n' "$AAP_TOKEN" | curl "${args[@]}" "$AAP_URL$2"
+          }
+          BODY="$RUNNER_TEMP/aap-backup.json"
+          trap 'rm -f "$BODY"' EXIT
+          jq -n --arg v "$VERSION" --arg env "$ENVIRONMENT" --arg user "$DB_USERNAME" --arg port "$DB_PORT" \
+            --arg proc "$DB_CREATE_PROCEDURE" --arg tbl "$DB_TABLE_EXPORT_RESTORE" --arg schema "$DB_SCHEMA" \
+            '{extra_vars: {user_action: "create", db_user: $user, ldb_port: $port, db_schema: $schema,
+              db_create_procedure: $proc, table_export_restore: $tbl,
+              atria_backend_version: $v, target_environment: $env}}' > "$BODY"
+          JOB=$(api POST "/api/controller/v2/job_templates/$AAP_TEMPLATE_BACKUP_ID/launch/" "$BODY" | jq -r '.job // empty')
+          if [ -z "$JOB" ]; then echo "::error::AAP no devolvio id de job"; exit 1; fi
+          STATUS=""
+          for _ in $(seq 1 180); do
+            STATUS=$(api GET "/api/controller/v2/jobs/$JOB/" | jq -r '.status')
+            case "$STATUS" in successful|failed|error|canceled) break ;; esac
+            sleep 20
+          done
+          if [ "$STATUS" != successful ]; then echo "::error::job AAP $JOB termino con estado $STATUS"; exit 1; fi
+          # Supuesto a verificar en el piloto: el job publica created_backup via set_stats
+          CREATED=$(api GET "/api/controller/v2/jobs/$JOB/" | jq -r '.artifacts.created_backup // empty')
+          if [ -z "$CREATED" ]; then echo "::error::el job AAP $JOB no devolvio el nombre de la copia"; exit 1; fi
+          echo "backup-name=$CREATED" >> "$GITHUB_OUTPUT"
+
+      - name: 4. Liquibase update (prod)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_LEVEL="${LOG_LEVEL:-INFO}"
+          EXTRA_ARGS=()
+          if [ "$DATABASE" = postgres ]; then
+            IMAGE="$LIQUIBASE_IMAGE_POSTGRES"
+            if [ -n "$DB_SCHEMA" ]; then EXTRA_ARGS+=("--default-schema-name=$DB_SCHEMA"); fi
+            if [ -n "$CONTEXTS" ]; then EXTRA_ARGS+=("--contexts=$CONTEXTS"); fi
+            if [ -n "$LABELS" ]; then EXTRA_ARGS+=("--labels=$LABELS"); fi
+          else
+            IMAGE="$LIQUIBASE_IMAGE_MONGO"
+            EXTRA_ARGS+=("--databaseClass=liquibase.ext.mongodb.database.MongoLiquibaseDatabase")
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/liquibase/workspace" -w /liquibase/workspace \
+            -e LIQUIBASE_COMMAND_URL -e LIQUIBASE_COMMAND_USERNAME -e LIQUIBASE_COMMAND_PASSWORD \
+            -e LIQUIBASE_COMMAND_CHANGELOG_FILE -e LIQUIBASE_SEARCH_PATH \
+            "$IMAGE" "${EXTRA_ARGS[@]}" --log-level="$LOG_LEVEL" update
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        env:
+          COPIA: ${{ steps.mongo.outputs.backup-name || steps.aap.outputs.backup-name || 'no creada' }}
+        run: |
+          {
+            echo "### Release de esquema a prod"
+            echo "- Motor: \`$DATABASE\`"
+            echo "- Version: \`$VERSION\`"
+            echo "- Etiqueta y copia: \`$VERSION\` / \`$COPIA\`"
+            echo "- Commit del caller: \`$GITHUB_SHA\`"
+            echo "- Una sola aprobacion del entorno prod para todo el release"
+          } >> "$GITHUB_STEP_SUMMARY"

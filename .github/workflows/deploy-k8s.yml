@@ -1,0 +1,459 @@
+# Despliegue a Kubernetes (AKS, EKS o GKE) con OIDC y sin secretos estáticos.
+# Reutilizable: se invoca con `uses:` desde un workflow de producto.
+# Estrategias: rolling (defecto), blue-green (cambio de selector de Service) y canary (Argo Rollouts, solo tool=helm).
+# Documentación: pipelines/deploy/README.md
+name: deploy-k8s
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod."
+        required: true
+        type: string
+      version:
+        description: "Versión desplegada (contrato 2.4), p. ej. 1.4.2."
+        required: true
+        type: string
+      artifact-ref:
+        description: "Imagen por digest: <registry>/<repo>@sha256:<64 hex>."
+        required: true
+        type: string
+      strategy:
+        description: "rolling (defecto), blue-green o canary (canary solo con tool=helm)."
+        required: false
+        type: string
+        default: rolling
+      canary-steps:
+        description: "Pesos de tráfico al canary en %, crecientes y terminados en 100, p. ej. 10,50,100."
+        required: false
+        type: string
+        default: "10,50,100"
+      canary-pause-seconds:
+        description: "Pausa entre pasos del canary, en segundos."
+        required: false
+        type: number
+        default: 120
+      health-check-url:
+        description: "URL de comprobación post-despliegue (debe responder 2xx)."
+        required: true
+        type: string
+      rollback-on-failure:
+        description: "Revertir automáticamente si falla el despliegue o la comprobación de salud."
+        required: false
+        type: boolean
+      app-name:
+        description: "Nombre de la aplicación: release de Helm, Deployment, Rollout y Service."
+        required: true
+        type: string
+      cloud:
+        description: "Proveedor del clúster: aks, eks o gke."
+        required: true
+        type: string
+      tool:
+        description: "helm (defecto) o kubectl (solo strategy=rolling)."
+        required: false
+        type: string
+        default: helm
+      chart-path:
+        description: "Ruta del chart de Helm dentro del repositorio (tool=helm)."
+        required: false
+        type: string
+        default: charts/app
+      values-dir:
+        description: "Directorio con <entorno>.yaml con los values por entorno."
+        required: false
+        type: string
+        default: deploy/values
+      manifests-path:
+        description: "Directorio con manifiestos YAML para tool=kubectl. Usa __IMAGE__ como marcador de la imagen."
+        required: false
+        type: string
+        default: k8s
+      runner:
+        description: 'Runner en JSON. Hosted por defecto; para clústeres privados usar ["self-hosted","linux","x64","secure-prod"] (2.1).'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      deployment-id:
+        description: "ID del deployment en la GitHub Deployments API."
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+      url:
+        description: "URL comprobada tras el despliegue."
+        value: ${{ jobs.deploy.outputs.url }}
+      version-deployed:
+        description: "Versión desplegada con éxito (vacía si falló)."
+        value: ${{ jobs.deploy.outputs.version-deployed }}
+      previous-version:
+        description: "Última versión exitosa anterior en este entorno (para rollback)."
+        value: ${{ jobs.deploy.outputs.previous-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-k8s-${{ inputs.environment }}-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+      packages: read
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      CLOUD: ${{ inputs.cloud }}
+      STRATEGY: ${{ inputs.strategy }}
+      TOOL: ${{ inputs.tool }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      GH_ACTOR: ${{ github.actor }}
+    steps:
+      - name: Exigir rollback-on-failure=true en staging y prod
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLLBACK: ${{ inputs.rollback-on-failure }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENVIRONMENT" =~ ^(staging|prod)$ ]] && [ "$ROLLBACK" != "true" ]; then
+            echo "::error::rollback-on-failure debe ser true en $ENVIRONMENT (recibido: $ROLLBACK)"; exit 1
+          fi
+
+      - name: Validar contrato de entrada
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          case "$CLOUD" in aks|eks|gke) ;; *) echo "::error::cloud debe ser aks, eks o gke"; exit 1 ;; esac
+          case "$STRATEGY" in rolling|blue-green|canary) ;; *) echo "::error::strategy debe ser rolling, blue-green o canary"; exit 1 ;; esac
+          case "$TOOL" in helm|kubectl) ;; *) echo "::error::tool debe ser helm o kubectl"; exit 1 ;; esac
+          if [ "$TOOL" = "kubectl" ] && [ "$STRATEGY" != "rolling" ]; then
+            echo "::error::tool=kubectl solo admite strategy=rolling"; exit 1
+          fi
+          if [ "$TOOL" = "helm" ] && [ "$STRATEGY" = "canary" ] && [ -z "${CANARY_STEPS}" ]; then
+            echo "::error::canary requiere canary-steps"; exit 1
+          fi
+          if ! [[ "$ARTIFACT_REF" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::artifact-ref debe ser una imagen por digest (@sha256:...), nunca un tag"; exit 1
+          fi
+          if [ "$STRATEGY" = "canary" ]; then
+            prev=0
+            IFS=',' read -ra W <<< "$CANARY_STEPS"
+            for w in "${W[@]}"; do
+              if ! [[ "$w" =~ ^[0-9]+$ ]] || [ "$w" -le "$prev" ] || [ "$w" -gt 100 ]; then
+                echo "::error::canary-steps inválido: $CANARY_STEPS"; exit 1
+              fi
+              prev=$w
+            done
+            if [ "$prev" -ne 100 ]; then echo "::error::canary-steps debe terminar en 100"; exit 1; fi
+          fi
+
+      - name: Verificar procedencia de la imagen (solo si existe atestación; bloqueante en prod)
+        run: |
+          set -euo pipefail
+          if [[ "$ARTIFACT_REF" != *@sha256:* ]]; then echo "Sin digest de imagen: se omite la verificación de procedencia."; exit 0; fi
+          digest="${ARTIFACT_REF##*@}"
+          count=$(gh api "repos/$REPO/attestations/$digest" --jq '.attestations | length' 2>/dev/null || echo 0)
+          if [ "$count" = "0" ]; then
+            msg="no existe atestación de procedencia para $digest en $REPO (genérala en el build, WS2)"
+            if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"; exit 0
+          fi
+          if [[ "$ARTIFACT_REF" == ghcr.io/* ]]; then echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin; fi
+          if gh attestation verify "oci://$ARTIFACT_REF" --owner "$OWNER"; then exit 0; fi
+          msg="la verificación de procedencia de $digest falló"
+          if [ "$ENVIRONMENT" = "prod" ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg"
+
+  deploy:
+    needs: validate
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.health-check-url }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      packages: read
+      attestations: read
+    outputs:
+      deployment-id: ${{ steps.dep.outputs.deployment-id }}
+      previous-version: ${{ steps.dep.outputs.previous-version }}
+      version-deployed: ${{ steps.out.outputs.version-deployed }}
+      url: ${{ steps.out.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      STRATEGY: ${{ inputs.strategy }}
+      TOOL: ${{ inputs.tool }}
+      HEALTH_URL: ${{ inputs.health-check-url }}
+      ROLLBACK_ON_FAILURE: ${{ inputs.rollback-on-failure }}
+      APP: ${{ inputs.app-name }}
+      CHART: ${{ inputs.chart-path }}
+      VALUES_DIR: ${{ inputs.values-dir }}
+      MANIFESTS: ${{ inputs.manifests-path }}
+      CANARY_STEPS: ${{ inputs.canary-steps }}
+      CANARY_PAUSE: ${{ inputs.canary-pause-seconds }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      K8S_CLUSTER_NAME: ${{ vars.K8S_CLUSTER_NAME }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Login Azure (OIDC, sin secreto)
+        if: inputs.cloud == 'aks'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login AWS (OIDC, sin secreto)
+        if: inputs.cloud == 'eks'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login GCP (Workload Identity Federation)
+        if: inputs.cloud == 'gke'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Instalar Helm
+        if: inputs.tool == 'helm'
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+
+      # Verificación T-27: `az aks install-cli --kubelogin-install-location` verificado en el código fuente de azure-cli
+      # (acs/_params.py, opción inferida por convención de nombre). La página oficial de referencia se truncó y no se confirmó allí.
+      - name: Credenciales del clúster (AKS + kubelogin)
+        if: inputs.cloud == 'aks'
+        run: |
+          set -euo pipefail
+          az aks get-credentials --resource-group "$AZURE_RESOURCE_GROUP" --name "$K8S_CLUSTER_NAME" --overwrite-existing
+          mkdir -p "$RUNNER_TEMP/bin"
+          # az aks install-cli --kubelogin-install-location: verificado solo en el código fuente de azure-cli
+          # (acs/_params.py, nombre inferido); la página oficial estaba truncada -> no verificado en docs oficiales.
+          az aks install-cli --kubelogin-install-location "$RUNNER_TEMP/bin/kubelogin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Credenciales del clúster (EKS)
+        if: inputs.cloud == 'eks'
+        run: aws eks update-kubeconfig --name "$K8S_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Credenciales del clúster (GKE)
+        if: inputs.cloud == 'gke'
+        run: gcloud container clusters get-credentials "$K8S_CLUSTER_NAME" --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+
+      - name: Calcular versión previa y registrar despliegue
+        id: dep
+        run: |
+          set -euo pipefail
+          prev=""
+          while IFS=$'\t' read -r id payload; do
+            [ -n "$id" ] || continue
+            state=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+            [ "$state" = "success" ] || continue
+            v=$(jq -r '.version // ""' <<< "$payload")
+            if [ -n "$v" ] && [ "$v" != "$VERSION" ]; then prev="$v"; break; fi
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | select((.payload.target // "") == "k8s") | "\(.id)\t\(.payload|tostring)"')
+          payload=$(jq -cn --arg v "$VERSION" --arg r "$ARTIFACT_REF" --arg s "$STRATEGY" --arg t "$TOOL" \
+            '{version:$v, artifact_ref:$r, target:"k8s", strategy:$s, tool:$t}')
+          digest=""
+          if [[ "$ARTIFACT_REF" == *@sha256:* ]]; then digest="${ARTIFACT_REF##*@}"; fi
+          payload=$(jq -c --arg d "$digest" --arg run "$GITHUB_RUN_ID" '. + {artifact_digest:$d, run_id:$run}' <<< "$payload")
+          dep_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg desc "deploy k8s $TOOL/$STRATEGY" --argjson payload "$payload" \
+            '{ref:$sha, environment:$env, task:"deploy", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:$desc}' \
+            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+          gh api -X POST "repos/$REPO/deployments/$dep_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          echo "deployment-id=$dep_id" >> "$GITHUB_OUTPUT"
+          echo "previous-version=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: "Desplegar con Helm (rolling)"
+        id: hdeploy
+        if: inputs.tool == 'helm' && inputs.strategy == 'rolling'
+        run: |
+          set -euo pipefail
+          args=(--set-string "image.reference=$ARTIFACT_REF" --set-string "app.version=$VERSION")
+          if [ -f "$VALUES_DIR/$ENVIRONMENT.yaml" ]; then args+=(-f "$VALUES_DIR/$ENVIRONMENT.yaml"); fi
+          atomic=()
+          if [ "$ROLLBACK_ON_FAILURE" = "true" ]; then atomic=(--atomic); fi
+          helm upgrade --install "$APP" "$CHART" -n "$K8S_NAMESPACE" --create-namespace \
+            "${args[@]}" --wait --timeout 10m "${atomic[@]}"
+
+      # Verificación T-27: `kubectl rollout status deployment/<app> --timeout=10m` verificado en kubernetes.io (--timeout y --watch, por defecto true).
+      - name: "Desplegar con kubectl (rolling)"
+        id: kdeploy
+        if: inputs.tool == 'kubectl'
+        run: |
+          set -euo pipefail
+          # Renderiza la imagen por digest en los manifiestos y aplica; el rollout se controla con rollout status.
+          for f in "$MANIFESTS"/*.yaml; do
+            sed "s|__IMAGE__|$ARTIFACT_REF|g" "$f"
+            echo "---"
+          done | kubectl -n "$K8S_NAMESPACE" apply -f -
+          kubectl -n "$K8S_NAMESPACE" rollout status "deployment/$APP" --timeout=10m
+
+      - name: Determinar color activo (blue-green)
+        id: color
+        if: inputs.tool == 'helm' && inputs.strategy == 'blue-green'
+        run: |
+          set -euo pipefail
+          active=$(kubectl -n "$K8S_NAMESPACE" get svc "$APP" -o jsonpath='{.spec.selector.track}' 2>/dev/null || true)
+          if [ "$active" = "blue" ]; then new=green; else new=blue; fi
+          echo "old=${active:-none}" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar color nuevo (blue-green, sin tráfico)
+        id: bgdeploy
+        if: inputs.tool == 'helm' && inputs.strategy == 'blue-green'
+        env:
+          NEW_TRACK: ${{ steps.color.outputs.new }}
+        run: |
+          set -euo pipefail
+          args=(--set-string "track=$NEW_TRACK" --set-string "image.reference=$ARTIFACT_REF" --set-string "app.version=$VERSION")
+          if [ -f "$VALUES_DIR/$ENVIRONMENT.yaml" ]; then args+=(-f "$VALUES_DIR/$ENVIRONMENT.yaml"); fi
+          helm upgrade --install "$APP-$NEW_TRACK" "$CHART" -n "$K8S_NAMESPACE" --create-namespace \
+            "${args[@]}" --wait --timeout 10m
+
+      - name: Conmutar tráfico al color nuevo (blue-green)
+        id: switch
+        if: inputs.tool == 'helm' && inputs.strategy == 'blue-green'
+        env:
+          NEW_TRACK: ${{ steps.color.outputs.new }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE" patch service "$APP" --type merge \
+            -p "{\"spec\":{\"selector\":{\"app.kubernetes.io/name\":\"$APP\",\"track\":\"$NEW_TRACK\"}}}"
+
+      - name: Desplegar canary (Helm + Argo Rollouts)
+        id: cdeploy
+        if: inputs.tool == 'helm' && inputs.strategy == 'canary'
+        run: |
+          set -euo pipefail
+          args=(--set-string "image.reference=$ARTIFACT_REF" --set-string "app.version=$VERSION" \
+                --set canary.enabled=true --set "canary.weights={$CANARY_STEPS}" --set "canary.pauseSeconds=$CANARY_PAUSE")
+          if [ -f "$VALUES_DIR/$ENVIRONMENT.yaml" ]; then args+=(-f "$VALUES_DIR/$ENVIRONMENT.yaml"); fi
+          # Sin --wait: el avance del canary lo monitoriza el paso siguiente.
+          helm upgrade --install "$APP" "$CHART" -n "$K8S_NAMESPACE" --create-namespace "${args[@]}" --timeout 10m
+
+      # Verificación T-27: status.phase (valores Healthy, Degraded, Progressing, Paused) y status.observedGeneration
+      # verificados en pkg/apis/rollouts/v1alpha1/types.go de argo-rollouts. No aparecen en las páginas de documentación de usuario consultadas.
+      - name: Monitorizar canary (Rollout + health-check-url)
+        id: canary
+        if: inputs.tool == 'helm' && inputs.strategy == 'canary'
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 3600 ))
+          fails=0
+          while :; do
+            gen=$(kubectl -n "$K8S_NAMESPACE" get rollout "$APP" -o jsonpath='{.metadata.generation}')
+            obs=$(kubectl -n "$K8S_NAMESPACE" get rollout "$APP" -o jsonpath='{.status.observedGeneration}')
+            # status.phase (Healthy, Degraded, Progressing, Paused) y status.observedGeneration: verificados
+            # en argo-rollouts types.go (RolloutStatus); no en la documentación de usuario.
+            phase=$(kubectl -n "$K8S_NAMESPACE" get rollout "$APP" -o jsonpath='{.status.phase}')
+            if [ "$gen" = "$obs" ]; then
+              case "$phase" in
+                Healthy) echo "Canary completado."; exit 0 ;;
+                Degraded) echo "::error::Rollout en estado Degraded"; exit 1 ;;
+              esac
+            fi
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              fails=0
+            else
+              fails=$((fails + 1)); echo "::warning::health-check fallido ($fails/3)"
+            fi
+            if [ "$fails" -ge 3 ]; then echo "::error::health-check fallido durante el canary"; exit 1; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then echo "::error::timeout del canary"; exit 1; fi
+            sleep 20
+          done
+
+      - name: Comprobar salud (health-check-url)
+        id: health
+        if: inputs.strategy != 'canary'
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "Salud OK (intento $i)"; exit 0
+            fi
+            echo "Sin respuesta (intento $i)"; sleep 15
+          done
+          echo "::error::health-check-url no responde tras 20 intentos"; exit 1
+
+      # Verificación T-27:
+      # - `kubectl rollout undo deployment/<app>` (sin --to-revision = revisión anterior): verificado en kubernetes.io.
+      # - `kubectl patch rollout --subresource=status` y el campo status.abort: campo `abort` verificado en types.go de argo-rollouts;
+      #   la flag --subresource de kubectl patch: no verificado.
+      # - `helm rollback <app> 0` (0 = revisión anterior): no verificado (no consultada la documentación de Helm).
+      - name: Revertir si falla (rollback-on-failure)
+        id: rollback
+        if: ${{ always() && inputs.rollback-on-failure && (steps.health.outcome == 'failure' || steps.kdeploy.outcome == 'failure' || steps.canary.outcome == 'failure') }}
+        env:
+          OLD_TRACK: ${{ steps.color.outputs.old }}
+        run: |
+          set -euo pipefail
+          echo "Revirtiendo: tool=$TOOL strategy=$STRATEGY"
+          # Verificado: kubectl rollout undo (--to-revision, 0 = última revisión) y rollout status --timeout.
+          # no verificado: `helm rollback <release> 0` (0 = revisión anterior) y el parche de abort del canary.
+          if [ "$TOOL" = "kubectl" ]; then
+            kubectl -n "$K8S_NAMESPACE" rollout undo "deployment/$APP"
+            kubectl -n "$K8S_NAMESPACE" rollout status "deployment/$APP" --timeout=10m
+          elif [ "$STRATEGY" = "blue-green" ]; then
+            if [ -z "$OLD_TRACK" ] || [ "$OLD_TRACK" = "none" ]; then
+              echo "::error::no hay color previo al que volver"; exit 1
+            fi
+            kubectl -n "$K8S_NAMESPACE" patch service "$APP" --type merge \
+              -p "{\"spec\":{\"selector\":{\"app.kubernetes.io/name\":\"$APP\",\"track\":\"$OLD_TRACK\"}}}"
+          elif [ "$STRATEGY" = "canary" ]; then
+            # no verificado: patch de status.abort con --subresource=status (campo abort verificado en types.go;
+            # la forma del parche con kubectl no se ha confirmado en docs ni con el CLI).
+            kubectl -n "$K8S_NAMESPACE" patch rollout "$APP" --type merge --subresource=status \
+              -p '{"status":{"abort":true}}' || true
+            helm rollback "$APP" 0 -n "$K8S_NAMESPACE" --wait --timeout 10m
+          else
+            helm rollback "$APP" 0 -n "$K8S_NAMESPACE" --wait --timeout 10m
+          fi
+
+      - name: Salidas del despliegue
+        id: out
+        if: success()
+        run: |
+          echo "version-deployed=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$HEALTH_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar resultado en la Deployments API
+        if: always()
+        env:
+          DEP_ID: ${{ steps.dep.outputs.deployment-id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          if [ -z "$DEP_ID" ]; then echo "Sin deployment registrado."; exit 0; fi
+          state=failure
+          if [ "$JOB_STATUS" = "success" ]; then state=success; fi
+          gh api -X POST "repos/$REPO/deployments/$DEP_ID/statuses" -f state="$state" \
+            -f environment="$ENVIRONMENT" -f environment_url="$HEALTH_URL" -f log_url="$RUN_URL" >/dev/null

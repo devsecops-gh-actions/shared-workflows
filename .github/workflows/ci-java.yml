@@ -1,0 +1,275 @@
+# ci-java.yml
+# Workflow reutilizable: build y tests de proyectos Java con Maven o Gradle (autodetectado).
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI Java
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Subcarpeta del proyecto (monorepos). Relativa a la raiz del repo.
+        type: string
+        default: '.'
+      matrix:
+        description: 'JSON con combinaciones de runtime. Clave `java`. Ej.: {"java":["21","25"]}. Se fusiona con el valor por defecto.'
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` (jar/war ejecutable) o `library` (jar + sources + javadoc).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar tests (`mvn verify` / `./gradlew build`) en la matriz.
+        type: boolean
+        default: true
+      publish:
+        description: Solo `library`. Valida tag vX.Y.Z y coincidencia con la version del proyecto. No publica; la publicacion es de publish-package.yml.
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+      build-tool:
+        description: '`auto` (pom.xml -> maven; build.gradle* -> gradle), `maven` o `gradle`.'
+        type: string
+        default: auto
+    outputs:
+      version:
+        description: Version semver (2.4).
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido.
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta del artefacto principal (jar/war) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+      package-id:
+        description: Solo library. Coordenadas `groupId:artifactId:version`.
+        value: ${{ jobs.build-and-test.outputs.package-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      primary: ${{ steps.matrix.outputs.primary }}
+    steps:
+      - name: Fusionar matriz con valores por defecto
+        id: matrix
+        env:
+          INPUT_MATRIX: ${{ inputs.matrix || '{}' }}
+        run: |
+          set -euo pipefail
+          defaults='{"java":["21"]}'
+          m=$(jq -cn --argjson d "$defaults" --argjson i "$INPUT_MATRIX" '$d * $i')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "primary=$(jq -r '.java[0]' <<< "$m")" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    if: ${{ inputs.run-tests }}
+    runs-on: ${{ matrix.os || fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar herramienta de build
+        id: tool
+        working-directory: .
+        env:
+          WD: ${{ inputs.working-directory }}
+          TOOL_INPUT: ${{ inputs.build-tool }}
+        run: |
+          set -euo pipefail
+          tool="$TOOL_INPUT"
+          if [ "$tool" = "auto" ]; then
+            if [ -f "$WD/pom.xml" ]; then tool=maven
+            elif ls "$WD"/build.gradle* "$WD"/settings.gradle* >/dev/null 2>&1; then tool=gradle
+            else echo "::error::No se encuentra pom.xml ni build.gradle(.kts) en '$WD'."; exit 1; fi
+          fi
+          case "$tool" in
+            maven)  [ -f "$WD/pom.xml" ] || { echo "::error::Falta pom.xml"; exit 1; } ;;
+            gradle) [ -x "$WD/gradlew" ] || { echo "::error::Falta el wrapper ./gradlew (obligatorio)."; exit 1; } ;;
+            *) echo "::error::build-tool no soportado: $tool"; exit 1 ;;
+          esac
+          echo "tool=$tool" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar JDK y cache de dependencias
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: ${{ steps.tool.outputs.tool }}
+
+      - name: Tests (verify)
+        env:
+          TOOL: ${{ steps.tool.outputs.tool }}
+        run: |
+          set -euo pipefail
+          case "$TOOL" in
+            maven)  mvn -B -ntp verify ;;
+            gradle) ./gradlew --no-daemon build ;;
+          esac
+
+  build-and-test:
+    name: build-and-test
+    needs: [prepare, test]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      artifact-path: ${{ steps.pkg.outputs.artifact-path }}
+      package-id: ${{ steps.pkg.outputs.package-id }}
+    steps:
+      - name: Comprobar resultado de tests
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$TEST_RESULT" != "success" ] && [ "$TEST_RESULT" != "skipped" ]; then
+            echo "::error::El job test ha terminado con '$TEST_RESULT'."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar herramienta de build
+        id: tool
+        env:
+          WD: ${{ inputs.working-directory }}
+          TOOL_INPUT: ${{ inputs.build-tool }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          tool="$TOOL_INPUT"
+          if [ "$tool" = "auto" ]; then
+            if [ -f "$WD/pom.xml" ]; then tool=maven
+            elif ls "$WD"/build.gradle* "$WD"/settings.gradle* >/dev/null 2>&1; then tool=gradle
+            else echo "::error::No se encuentra pom.xml ni build.gradle(.kts) en '$WD'."; exit 1; fi
+          fi
+          case "$tool" in
+            maven)  [ -f "$WD/pom.xml" ] || { echo "::error::Falta pom.xml"; exit 1; } ;;
+            gradle) [ -x "$WD/gradlew" ] || { echo "::error::Falta el wrapper ./gradlew (obligatorio)."; exit 1; } ;;
+            *) echo "::error::build-tool no soportado: $tool"; exit 1 ;;
+          esac
+          echo "tool=$tool" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar JDK (runtime principal) y cache
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ needs.prepare.outputs.primary }}
+          cache: ${{ steps.tool.outputs.tool }}
+
+      - name: Build
+        env:
+          TOOL: ${{ steps.tool.outputs.tool }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          case "$TOOL" in
+            maven) mvn -B -ntp package -DskipTests ;;
+            gradle)
+              ./gradlew --no-daemon assemble
+              if [ "$KIND" = "library" ]; then ./gradlew --no-daemon sourcesJar javadocJar; fi ;;
+          esac
+
+      - name: Calcular version y nombre de artefacto
+        id: meta
+        env:
+          TOOL: ${{ steps.tool.outputs.tool }}
+          PUBLISH: ${{ inputs.publish }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          if [ "$TOOL" = "maven" ]; then
+            base=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1)
+          else
+            base=$(./gradlew -q --no-daemon properties | sed -n 's/^version: //p' | tail -n1)
+          fi
+          base="${base%%[-+]*}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base:-0.0.0}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            [ "$KIND" = "library" ] || { echo "::error::publish=true solo aplica a kind=library."; exit 1; }
+            [[ "$GITHUB_REF" == refs/tags/v* ]] || { echo "::error::publish=true requiere un tag v*."; exit 1; }
+            [ "$version" = "$base" ] || { echo "::error::El tag ($version) no coincide con la version del proyecto ($base)."; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Empaquetar
+        id: pkg
+        env:
+          TOOL: ${{ steps.tool.outputs.tool }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$out"
+          shopt -s nullglob
+          if [ "$TOOL" = "maven" ]; then
+            files=( target/*.jar target/*.war )
+            group=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.groupId | tail -n1)
+            art=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.artifactId | tail -n1)
+            ver=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1)
+          else
+            files=( build/libs/*.jar )
+            group=$(./gradlew -q --no-daemon properties | sed -n 's/^group: //p' | tail -n1)
+            art=$(./gradlew -q --no-daemon properties | sed -n 's/^name: //p' | tail -n1)
+            ver=$(./gradlew -q --no-daemon properties | sed -n 's/^version: //p' | tail -n1)
+          fi
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::No se han generado jar/war."; exit 1; }
+          cp "${files[@]}" "$out/"
+          main=""
+          for f in "$out"/*.jar "$out"/*.war; do
+            case "$(basename "$f")" in *-sources.jar|*-javadoc.jar|*-plain.jar|*-tests.jar) continue ;; esac
+            main="$f"; break
+          done
+          [ -n "$main" ] || main=$(ls "$out"/*.jar "$out"/*.war | head -n1)
+          echo "artifact-path=artifacts/$(basename "$main")" >> "$GITHUB_OUTPUT"
+          if [ "$KIND" = "library" ]; then
+            echo "package-id=$group:$art:$ver" >> "$GITHUB_OUTPUT"
+          else
+            echo "package-id=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

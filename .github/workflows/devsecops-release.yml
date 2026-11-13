@@ -1,0 +1,316 @@
+# devsecops-release: workflow reutilizable del bot de release (PLAN.md 2.8 y WS5).
+#
+# Lo invoca un workflow "caller" de cada repo (ver bots/release/examples/caller.yml).
+# Dos jobs:
+#
+#   prepare  push a la rama por defecto o workflow_dispatch. Calcula la siguiente versión desde los
+#            Conventional Commits desde el último tag vX.Y.Z. Si hay feat, fix o BREAKING CHANGE,
+#            abre (o sustituye) el PR de release desde bot/release/vX.Y.Z con CHANGELOG.md
+#            (y opcionalmente la clave "version" de un JSON, p. ej. package.json).
+#   tag      pull_request cerrado y mergeado desde bot/release/*. Crea el tag vX.Y.Z sobre el commit de
+#            merge. El merge de ese PR es el disparador de la release; el tag es su resultado.
+#            release.yml (WS2) todavía no existe.
+#
+# Permisos: el workflow no tiene permisos por defecto. Cada job declara los suyos. Las escrituras
+# (rama, PR y tag) usan el token de vida corta de la GitHub App devsecops-release, no GITHUB_TOKEN:
+#   - Un PR abierto con GITHUB_TOKEN no dispara workflows, y devsecops-validator debe validar el PR de release.
+#   - Un tag creado con GITHUB_TOKEN no dispararía los workflows que consuman tags (p. ej. release.yml, WS2).
+# Ningún job escribe en la rama por defecto: solo se crean ramas bot/release/* y tags.
+# El job prepare ejecuta la herramienta descargada por SHA y lee el historial. No ejecuta código del repo.
+# Sin force push.
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tool-repository:
+        description: "Repo que contiene bots/release (p. ej. <org>-platform/bots)"
+        type: string
+        required: true
+      tool-ref:
+        description: "SHA completo (40 caracteres) del commit del repo de herramientas"
+        type: string
+        required: true
+      tool-path:
+        description: "Ruta de bots/release dentro del repo de herramientas"
+        type: string
+        required: false
+        default: bots/release
+      app-id:
+        description: "ID numérico de la GitHub App devsecops-release (variable DEVSECOPS_RELEASE_APP_ID del caller)"
+        type: string
+        required: true
+      default-branch:
+        description: "Rama por defecto de la que se calcula la release"
+        type: string
+        required: false
+        default: main
+      changelog-file:
+        description: "Ruta del CHANGELOG (Keep a Changelog)"
+        type: string
+        required: false
+        default: CHANGELOG.md
+      version-file:
+        description: "Fichero de versión que se actualiza en el PR: *.json (clave version), pom.xml, pyproject.toml, *.csproj o go.mod (sin versión: solo tag). Vacío = solo CHANGELOG"
+        type: string
+        required: false
+        default: ""
+      create-release:
+        description: "true: el job tag crea también la GitHub Release con las notas de la sección del CHANGELOG"
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      app-private-key:
+        description: "Clave privada de la App (SEC_DEVSECOPS_RELEASE_PRIVATE_KEY)"
+        required: true
+
+permissions: {}
+
+# Serializa prepare y tag del mismo repo: el merge de un PR de release dispara ambos.
+concurrency:
+  group: devsecops-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout de la rama por defecto (sin credenciales persistentes)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.default-branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Descargar herramienta fijada por SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.tool-repository }}
+          ref: ${{ inputs.tool-ref }}
+          path: .devsecops-release-tool
+          persist-credentials: false
+
+      - name: Excluir la herramienta del árbol de git
+        run: echo ".devsecops-release-tool/" >> .git/info/exclude
+
+      - name: Preparar Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Calcular versión (sin escribir) y decidir
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TOOL_REF: ${{ inputs.tool-ref }}
+          TOOL_PATH: ${{ inputs.tool-path }}
+          CHANGELOG_FILE: ${{ inputs.changelog-file }}
+          VERSION_FILE: ${{ inputs.version-file }}
+        run: |
+          set -euo pipefail
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+
+          [[ "$TOOL_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::tool-ref debe ser un SHA completo de 40 caracteres"; exit 1; }
+          for p in "$TOOL_PATH" "$CHANGELOG_FILE"; do
+            [[ "$p" =~ ^[A-Za-z0-9_./-]+$ && "$p" != *..* ]] || { echo "::error::ruta no válida: $p"; exit 1; }
+          done
+          if [[ -n "$VERSION_FILE" ]]; then
+            [[ "$VERSION_FILE" =~ ^[A-Za-z0-9_./-]+(\.json|pom\.xml|pyproject\.toml|\.csproj|go\.mod)$ && "$VERSION_FILE" != *..* ]] \
+              || { echo "::error::version-file no soportado o ruta no válida: $VERSION_FILE"; exit 1; }
+          fi
+
+          node ".devsecops-release-tool/${TOOL_PATH}/scripts/next-version.mjs" --repo . > "$RUNNER_TEMP/plan.json"
+          cat "$RUNNER_TEMP/plan.json"; echo
+
+          NEXT=$(jq -r '.next // empty' "$RUNNER_TEMP/plan.json")
+          BUMP=$(jq -r '.bump' "$RUNNER_TEMP/plan.json")
+          BASE=$(jq -r '.base // empty' "$RUNNER_TEMP/plan.json")
+          emit next "$NEXT"; emit bump "$BUMP"; emit base "$BASE"
+
+          if [[ -z "$NEXT" ]]; then
+            echo "::notice::Sin feat, fix ni BREAKING CHANGE desde ${BASE:-el inicio}. No hay release."
+            emit publish false; exit 0
+          fi
+          if gh api "repos/$REPO/git/ref/tags/v$NEXT" >/dev/null 2>&1; then
+            echo "::notice::El tag v$NEXT ya existe. No hay release nueva."
+            emit publish false; exit 0
+          fi
+          MERGED=$(gh pr list --repo "$REPO" --state merged --head "bot/release/v$NEXT" --json number --jq 'length')
+          if [[ "$MERGED" != "0" ]]; then
+            echo "::notice::El PR de release v$NEXT ya está mergeado. El job tag se encarga del tag."
+            emit publish false; exit 0
+          fi
+          emit publish true
+
+      - name: Token de vida corta de la App devsecops-release
+        id: app
+        if: steps.plan.outputs.publish == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Escribir changelog, cerrar PR obsoletos, crear rama y abrir PR de release
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ inputs.default-branch }}
+          TOOL_PATH: ${{ inputs.tool-path }}
+          CHANGELOG_FILE: ${{ inputs.changelog-file }}
+          VERSION_FILE: ${{ inputs.version-file }}
+          PLAN_NEXT: ${{ steps.plan.outputs.next }}
+          PLAN_BUMP: ${{ steps.plan.outputs.bump }}
+          PLAN_BASE: ${{ steps.plan.outputs.base }}
+        run: |
+          set -euo pipefail
+          NEXT="$PLAN_NEXT"
+          BRANCH="bot/release/v${NEXT}"
+          [[ "$BRANCH" =~ ^bot/release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::Rama no permitida: $BRANCH"; exit 1; }
+
+          SCRIPT=".devsecops-release-tool/${TOOL_PATH}/scripts/next-version.mjs"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          FILES=("$CHANGELOG_FILE")
+          ARGS=(--repo . --changelog "$CHANGELOG_FILE" --notes-file "$NOTES" --write)
+          if [[ -n "$VERSION_FILE" ]]; then FILES+=("$VERSION_FILE"); ARGS+=(--version-file "$VERSION_FILE"); fi
+
+          # Credenciales solo para este paso: fetch y push de la rama bot/release/*.
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${REPO}.git"
+
+          # 1) Escribir CHANGELOG y versión en el árbol de trabajo (sin commit todavía).
+          node "$SCRIPT" "${ARGS[@]}" > "$RUNNER_TEMP/release-write.json"
+          [[ "$(jq -r .next "$RUNNER_TEMP/release-write.json")" == "$NEXT" ]] || { echo "::error::La versión calculada cambió entre pasos"; exit 1; }
+
+          # 2) PR de release abiertos: los de otra versión se cierran; el de esta versión se conserva si el contenido no cambia.
+          SAME_PR=""
+          OPEN=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("bot/release/")) | "\(.number)\t\(.headRefName)"')
+          while IFS=$'\t' read -r num ref; do
+            [[ -z "$num" ]] && continue
+            if [[ "$ref" == "$BRANCH" ]]; then SAME_PR="$num"; continue; fi
+            gh pr close "$num" --repo "$REPO" --delete-branch \
+              --comment "Sustituido: hay una versión nueva (v${NEXT}) calculada desde ${DEFAULT_BRANCH}."
+          done <<< "$OPEN"
+
+          REMOTE_BRANCH=0
+          if git fetch --no-tags --depth=1 origin "$BRANCH" >/dev/null 2>&1; then
+            REMOTE_BRANCH=1
+            if [[ -n "$SAME_PR" ]] && git diff --quiet FETCH_HEAD -- "${FILES[@]}"; then
+              echo "::notice::El PR #${SAME_PR} ya contiene el changelog de v${NEXT}. No se cambia nada."
+              exit 0
+            fi
+          fi
+          if [[ -n "$SAME_PR" ]]; then
+            gh pr close "$SAME_PR" --repo "$REPO" --delete-branch \
+              --comment "Sustituido: el changelog de v${NEXT} ha cambiado desde que se abrió este PR."
+          elif [[ "$REMOTE_BRANCH" == "1" ]]; then
+            # Rama huérfana (sin PR abierto): se borra y se recrea. Nunca force push.
+            git push origin --delete "$BRANCH" >/dev/null 2>&1 || true
+          fi
+
+          # 3) Rama nueva desde la rama por defecto y commit.
+          git checkout -q -B "$BRANCH"
+          git add -- "${FILES[@]}"
+          git config user.name "devsecops-release[bot]"
+          git config user.email "devsecops-release[bot]@users.noreply.github.com"
+          git commit -q -m "chore(release): v${NEXT}" \
+            -m "Generado por devsecops-release a partir de $(git rev-parse --short HEAD) en ${DEFAULT_BRANCH}."
+          git push -q origin "HEAD:refs/heads/${BRANCH}"
+
+          # 4) PR de release. Si la etiqueta no existe, se crea sin ella.
+          BODY="$RUNNER_TEMP/release-pr-body.md"
+          {
+            echo "Propuesta de release **v${NEXT}** (bump \`${PLAN_BUMP}\` desde \`${PLAN_BASE:-sin tags}\`)."
+            echo
+            echo "Revisa el changelog antes de aprobar. Al hacer merge, el job \`tag\` crea \`v${NEXT}\` sobre el commit de merge y el merge de ese PR dispara la release."
+            echo
+            cat "$NOTES"
+          } > "$BODY"
+          gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+            --title "chore(release): v${NEXT}" --body-file "$BODY" --label "bot:release" \
+            || gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+                 --title "chore(release): v${NEXT}" --body-file "$BODY"
+
+  tag:
+    name: tag
+    # Solo PR de release mergeados desde una rama del propio repo (no forks).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'bot/release/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Token de vida corta de la App devsecops-release
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Crear el tag vX.Y.Z y, si se pide, la GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          CHANGELOG_FILE: ${{ inputs.changelog-file }}
+          CREATE_RELEASE: ${{ inputs.create-release }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_REF" =~ ^bot/release/v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] \
+            || { echo "::error::Rama de release no válida: $HEAD_REF"; exit 1; }
+          VERSION="${BASH_REMATCH[1]}"
+          TAG="v${VERSION}"
+          [[ "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge_commit_sha no disponible"; exit 1; }
+
+          # El CHANGELOG del commit mergeado debe contener la sección de esta versión.
+          CHANGELOG=$(gh api "repos/$REPO/contents/$CHANGELOG_FILE?ref=$MERGE_SHA" --jq .content | base64 -d)
+          if ! grep -q "^## \[$VERSION\]" <<< "$CHANGELOG"; then
+            echo "::error::CHANGELOG de $MERGE_SHA no contiene la sección [$VERSION]."
+            exit 1
+          fi
+
+          # Idempotente: si el tag ya apunta al mismo commit no se crea de nuevo; si apunta a otro, no se sobrescribe.
+          if EXISTING=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null); then
+            if [[ "$EXISTING" != "$MERGE_SHA" ]]; then
+              echo "::error::El tag $TAG ya existe en otro commit ($EXISTING). No se sobrescribe."
+              exit 1
+            fi
+            echo "::notice::El tag $TAG ya existe en $MERGE_SHA."
+          else
+            gh api --method POST "repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$MERGE_SHA" >/dev/null
+            echo "Tag $TAG creado sobre $MERGE_SHA. release.yml (WS2) todavía no existe."
+          fi
+
+          # GitHub Release opcional: notas = sección [VERSION] del CHANGELOG. Idempotente.
+          if [[ "$CREATE_RELEASE" == "true" ]]; then
+            if gh api "repos/$REPO/releases/tags/$TAG" >/dev/null 2>&1; then
+              echo "::notice::La GitHub Release $TAG ya existe."
+            else
+              NOTES="$RUNNER_TEMP/release-notes-$TAG.md"
+              awk -v h="## [$VERSION]" 'index($0, h) == 1 { f = 1; next } /^## \[/ { f = 0 } f' <<< "$CHANGELOG" > "$NOTES"
+              gh release create "$TAG" --repo "$REPO" --target "$MERGE_SHA" --title "$TAG" --notes-file "$NOTES"
+              echo "GitHub Release $TAG creada."
+            fi
+          fi

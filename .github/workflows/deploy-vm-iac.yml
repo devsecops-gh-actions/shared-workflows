@@ -1,0 +1,329 @@
+# Despliegue de infraestructura (IaaS) con Terraform: plan en PR y apply en entorno con aprobación.
+# - Job `plan`: sin `environment:`, con rol de SOLO LECTURA (variables TF_PLAN_*). Genera un plan guardado
+#   y lo sube como artefacto. Se puede ejecutar en pull_request con terraform-action=plan.
+# - Job `apply`: `environment:` del entorno (aprobación de required reviewers en prod). Aplica EXACTAMENTE
+#   el plan guardado que se generó en `plan`; si el estado cambió entre ambos, Terraform rechaza el plan.
+# Estrategias: rolling (defecto) y blue-green. El workflow pasa `-var deploy_strategy=<strategy>`;
+# el módulo de Terraform es quien implementa el reemplazo (instance refresh o grupo nuevo + balanceador).
+# Rollback: si falla la comprobación de salud (health-check-url opcional), vuelve a aplicar el ref previo del IaC.
+# Documentación: pipelines/deploy/README.md
+name: deploy-vm-iac
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod."
+        required: true
+        type: string
+      version:
+        description: "Versión de la infraestructura desplegada (contrato 2.4)."
+        required: true
+        type: string
+      artifact-ref:
+        description: "Ref del código IaC: SHA completo de 40 caracteres o tag vX.Y.Z."
+        required: true
+        type: string
+      strategy:
+        description: "rolling (defecto) o blue-green. Lo implementa el módulo de Terraform."
+        required: false
+        type: string
+        default: rolling
+      health-check-url:
+        description: "URL opcional comprobada tras el apply. Si falla y rollback-on-failure=true, se reaplica el ref previo."
+        required: false
+        type: string
+        default: ""
+      rollback-on-failure:
+        description: "Reaplicar el ref previo si falla la comprobación de salud."
+        required: false
+        type: boolean
+      iac-path:
+        description: "Directorio raíz de Terraform. Contiene environments/<entorno>.backend.hcl y environments/<entorno>.tfvars."
+        required: false
+        type: string
+        default: infra/terraform
+      cloud:
+        description: "Proveedor: azure o aws."
+        required: true
+        type: string
+      terraform-action:
+        description: "plan (solo genera y sube el plan, sin entorno) o apply (plan + apply con aprobación)."
+        required: false
+        type: string
+        default: apply
+      runner:
+        description: 'Runner en JSON. Por defecto hosted ("ubuntu-latest"); self-hosted secure-prod si la red de destino es privada (2.1).'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      deployment-id:
+        description: "ID del deployment en la GitHub Deployments API (solo con apply)."
+        value: ${{ jobs.apply.outputs.deployment-id }}
+      version-deployed:
+        description: "Versión aplicada con éxito (vacía si falló)."
+        value: ${{ jobs.apply.outputs.version-deployed }}
+      previous-version:
+        description: "Última versión aplicada con éxito antes en este entorno."
+        value: ${{ jobs.apply.outputs.previous-version }}
+      url:
+        description: "URL comprobada tras el apply."
+        value: ${{ jobs.apply.outputs.url }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vm-iac-${{ inputs.environment }}-${{ inputs.iac-path }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      CLOUD: ${{ inputs.cloud }}
+      STRATEGY: ${{ inputs.strategy }}
+      ACTION: ${{ inputs.terraform-action }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+    steps:
+      - name: Exigir rollback-on-failure=true en staging y prod
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLLBACK: ${{ inputs.rollback-on-failure }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENVIRONMENT" =~ ^(staging|prod)$ ]] && [ "$ROLLBACK" != "true" ]; then
+            echo "::error::rollback-on-failure debe ser true en $ENVIRONMENT (recibido: $ROLLBACK)"; exit 1
+          fi
+
+      - name: Validar contrato de entrada
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          case "$CLOUD" in azure|aws) ;; *) echo "::error::cloud debe ser azure o aws"; exit 1 ;; esac
+          case "$STRATEGY" in rolling|blue-green) ;; *) echo "::error::strategy debe ser rolling o blue-green"; exit 1 ;; esac
+          case "$ACTION" in plan|apply) ;; *) echo "::error::terraform-action debe ser plan o apply"; exit 1 ;; esac
+          if ! [[ "$ARTIFACT_REF" =~ ^([0-9a-f]{40}|v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::artifact-ref debe ser un SHA de 40 caracteres o un tag vX.Y.Z"; exit 1
+          fi
+
+  plan:
+    needs: validate
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    # Sin environment: el plan no requiere aprobación y usa el rol de solo lectura.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      STRATEGY: ${{ inputs.strategy }}
+      IAC: ${{ inputs.iac-path }}
+      PLAN_FILE: ${{ github.workspace }}/tfplan
+    steps:
+      - name: Checkout del ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.artifact-ref }}
+          persist-credentials: false
+
+      - name: Login Azure de solo lectura (OIDC)
+        if: inputs.cloud == 'azure'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.TF_PLAN_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login AWS de solo lectura (OIDC)
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Init, validate y plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$IAC" init -input=false -backend-config="environments/$ENVIRONMENT.backend.hcl"
+          terraform -chdir="$IAC" validate
+          terraform -chdir="$IAC" plan -input=false -lock-timeout=5m \
+            -var-file="environments/$ENVIRONMENT.tfvars" -var="deploy_strategy=$STRATEGY" \
+            -out="$PLAN_FILE"
+
+      - name: Resumen del plan en la ejecución
+        run: |
+          set -euo pipefail
+          terraform -chdir="$IAC" show -no-color "$PLAN_FILE" > "$RUNNER_TEMP/plan.txt"
+          { echo '```hcl'; head -c 60000 "$RUNNER_TEMP/plan.txt"; echo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir plan guardado
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ format('tfplan-{0}-{1}', inputs.environment, github.run_id) }}
+          path: ${{ github.workspace }}/tfplan
+          retention-days: 7
+          if-no-files-found: error
+
+  apply:
+    needs: [validate, plan]
+    if: ${{ inputs.terraform-action == 'apply' }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+    outputs:
+      deployment-id: ${{ steps.dep.outputs.deployment-id }}
+      previous-version: ${{ steps.dep.outputs.previous-version }}
+      version-deployed: ${{ steps.out.outputs.version-deployed }}
+      url: ${{ steps.out.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      ARTIFACT_REF: ${{ inputs.artifact-ref }}
+      STRATEGY: ${{ inputs.strategy }}
+      HEALTH_URL: ${{ inputs.health-check-url }}
+      ROLLBACK_ON_FAILURE: ${{ inputs.rollback-on-failure }}
+      IAC: ${{ inputs.iac-path }}
+      PLAN_FILE: ${{ github.workspace }}/plan/tfplan
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - name: Checkout del ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.artifact-ref }}
+          # Necesario para el rollback: git fetch del ref previo con las credenciales del job.
+          persist-credentials: true
+
+      - name: Descargar plan revisado
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ format('tfplan-{0}-{1}', inputs.environment, github.run_id) }}
+          path: ${{ github.workspace }}/plan
+
+      - name: Login Azure (OIDC del entorno)
+        if: inputs.cloud == 'azure'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login AWS (OIDC del entorno)
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Calcular versión previa y registrar despliegue
+        id: dep
+        run: |
+          set -euo pipefail
+          prev=""
+          prev_ref=""
+          while IFS=$'\t' read -r id payload; do
+            [ -n "$id" ] || continue
+            state=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+            [ "$state" = "success" ] || continue
+            v=$(jq -r '.version // ""' <<< "$payload")
+            if [ -n "$v" ] && [ "$v" != "$VERSION" ]; then
+              prev="$v"; prev_ref=$(jq -r '.artifact_ref // ""' <<< "$payload"); break
+            fi
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | select((.payload.target // "") == "vm-iac") | "\(.id)\t\(.payload|tostring)"')
+          payload=$(jq -cn --arg v "$VERSION" --arg r "$ARTIFACT_REF" --arg s "$STRATEGY" \
+            '{version:$v, artifact_ref:$r, target:"vm-iac", strategy:$s}')
+          digest=""
+          if [[ "$ARTIFACT_REF" == *@sha256:* ]]; then digest="${ARTIFACT_REF##*@}"; fi
+          payload=$(jq -c --arg d "$digest" --arg run "$GITHUB_RUN_ID" '. + {artifact_digest:$d, run_id:$run}' <<< "$payload")
+          dep_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg desc "deploy vm-iac $STRATEGY" --argjson payload "$payload" \
+            '{ref:$sha, environment:$env, task:"deploy", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:$desc}' \
+            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+          gh api -X POST "repos/$REPO/deployments/$dep_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          echo "deployment-id=$dep_id" >> "$GITHUB_OUTPUT"
+          echo "previous-version=$prev" >> "$GITHUB_OUTPUT"
+          echo "previous-artifact-ref=$prev_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Init y apply del plan revisado
+        id: apply
+        run: |
+          set -euo pipefail
+          terraform -chdir="$IAC" init -input=false -backend-config="environments/$ENVIRONMENT.backend.hcl"
+          terraform -chdir="$IAC" apply -input=false -lock-timeout=5m "$PLAN_FILE"
+
+      - name: Comprobar salud (health-check-url)
+        id: health
+        if: inputs.health-check-url != ''
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+              echo "Salud OK (intento $i)"; exit 0
+            fi
+            echo "Sin respuesta (intento $i)"; sleep 15
+          done
+          echo "::error::health-check-url no responde"; exit 1
+
+      - name: Reaplicar ref previo (rollback-on-failure)
+        if: ${{ always() && inputs.rollback-on-failure && steps.apply.outcome == 'success' && steps.health.outcome == 'failure' }}
+        env:
+          PREV_REF: ${{ steps.dep.outputs.previous-artifact-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PREV_REF" ]; then echo "::error::no hay ref previo registrado"; exit 1; fi
+          if [[ "$PREV_REF" =~ ^v ]]; then
+            git fetch --depth=1 origin "refs/tags/$PREV_REF:refs/tags/$PREV_REF"
+            git checkout --detach "refs/tags/$PREV_REF"
+          else
+            git fetch --depth=1 origin "$PREV_REF"
+            git checkout --detach FETCH_HEAD
+          fi
+          terraform -chdir="$IAC" init -input=false -backend-config="environments/$ENVIRONMENT.backend.hcl"
+          terraform -chdir="$IAC" plan -input=false -lock-timeout=5m \
+            -var-file="environments/$ENVIRONMENT.tfvars" -var="deploy_strategy=$STRATEGY" \
+            -out="$RUNNER_TEMP/rollback.tfplan"
+          terraform -chdir="$IAC" apply -input=false -lock-timeout=5m "$RUNNER_TEMP/rollback.tfplan"
+
+      - name: Salidas del despliegue
+        id: out
+        if: success()
+        run: |
+          echo "version-deployed=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$HEALTH_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar resultado en la Deployments API
+        if: always()
+        env:
+          DEP_ID: ${{ steps.dep.outputs.deployment-id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          if [ -z "$DEP_ID" ]; then echo "Sin deployment registrado."; exit 0; fi
+          state=failure
+          if [ "$JOB_STATUS" = "success" ]; then state=success; fi
+          url_arg=()
+          if [ -n "$HEALTH_URL" ]; then url_arg=(-f environment_url="$HEALTH_URL"); fi
+          gh api -X POST "repos/$REPO/deployments/$DEP_ID/statuses" -f state="$state" \
+            -f environment="$ENVIRONMENT" "${url_arg[@]}" -f log_url="$RUN_URL" >/dev/null

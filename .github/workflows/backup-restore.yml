@@ -1,0 +1,375 @@
+# Backup y restauracion de base de datos
+# - operation: backup  (workflow_call) -> copia antes de cada update, obligatoria en staging y prod.
+# - operation: restore (workflow_call o workflow_dispatch manual) -> restauracion con aprobacion del entorno.
+#
+# Motores:
+# - mongo: mongodump/mongorestore en contenedor (imagen de vars.MONGO_TOOLS_IMAGE). La copia es un
+#   artifact de GitHub (.archive.gz + .sha256). Retencion limitada: ver README (decision pendiente de almacen externo).
+# - postgres: copia gestionada por Ansible Automation Platform (AAP), como en la libreria Jenkins
+#   (ansible_backup.groovy / ansible_restore.groovy). Se lanza el job template por API.
+#
+# Credenciales: solo secretos de entorno (SEC_*); nunca en claro ni en argumentos de workflow.
+name: Backup y restauracion de BBDD
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        description: "backup o restore"
+        type: string
+        required: true
+      database:
+        description: "Motor de base de datos: mongo o postgres"
+        type: string
+        required: true
+      environment:
+        description: "Entorno de despliegue: dev, staging o prod"
+        type: string
+        required: true
+      version:
+        description: "Version X.Y.Z. Obligatoria en backup; forma parte del nombre de la copia"
+        type: string
+        required: false
+        default: ''
+      backup-name:
+        description: "restore: nombre de la copia (mongo: nombre del artifact; postgres: id devuelto por backup)"
+        type: string
+        required: false
+        default: ''
+      backup-run-id:
+        description: "restore mongo: id de la ejecucion que genero la copia (para descargar el artifact)"
+        type: string
+        required: false
+        default: ''
+      reason:
+        description: "Motivo de la restauracion. Obligatorio en prod"
+        type: string
+        required: false
+        default: ''
+      confirmation:
+        description: "restore: debe ser RESTAURAR-<entorno>, p. ej. RESTAURAR-prod"
+        type: string
+        required: false
+        default: ''
+      retention-days:
+        description: "Dias de retencion del artifact de la copia (mongo). Maximo 90 en GitHub Actions"
+        type: number
+        required: false
+        default: 30
+      runner:
+        description: "Etiquetas del runner en JSON (self-hosted secure-prod por defecto: acceso a la BBDD)"
+        type: string
+        required: false
+        default: '["self-hosted","linux","x64","secure-prod"]'
+    outputs:
+      backup-name:
+        description: "Nombre de la copia creada (artifact en mongo; id de copia AAP en postgres)"
+        value: ${{ jobs.backup.outputs.backup-name }}
+
+  workflow_dispatch:
+    inputs:
+      database:
+        description: "Motor de base de datos"
+        type: choice
+        options: [mongo, postgres]
+        required: true
+      environment:
+        description: "Entorno a restaurar"
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      backup-name:
+        description: "Nombre de la copia a restaurar"
+        type: string
+        required: true
+      backup-run-id:
+        description: "mongo: id de la ejecucion que genero la copia"
+        type: string
+        required: false
+        default: ''
+      reason:
+        description: "Motivo de la restauracion (obligatorio en prod)"
+        type: string
+        required: true
+      confirmation:
+        description: "Escribe RESTAURAR-<entorno>, p. ej. RESTAURAR-prod"
+        type: string
+        required: true
+      runner:
+        description: "Etiquetas del runner en JSON"
+        type: string
+        required: false
+        default: '["self-hosted","linux","x64","secure-prod"]'
+
+# Por defecto ningun permiso; cada job pide solo lo que usa.
+permissions:
+  contents: read
+
+concurrency:
+  group: db-backup-${{ inputs.database }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      operation: ${{ steps.check.outputs.operation }}
+    env:
+      # En workflow_dispatch no existe inputs.operation: la operacion manual es siempre restore
+      OPERATION: ${{ inputs.operation || 'restore' }}
+      DATABASE: ${{ inputs.database }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      BACKUP_NAME: ${{ inputs.backup-name }}
+      BACKUP_RUN_ID: ${{ inputs.backup-run-id }}
+      REASON: ${{ inputs.reason }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      RETENTION_DAYS: ${{ inputs.retention-days || 30 }}
+    steps:
+      - name: Validar entradas
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in backup|restore) ;; *) echo "::error::operation debe ser backup o restore"; exit 1 ;; esac
+          case "$DATABASE" in mongo|postgres) ;; *) echo "::error::database debe ser mongo o postgres"; exit 1 ;; esac
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment debe ser dev, staging o prod"; exit 1 ;; esac
+          if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || [ "$RETENTION_DAYS" -gt 90 ]; then
+            echo "::error::retention-days debe ser un entero entre 0 y 90"
+            exit 1
+          fi
+          if [ "$OPERATION" = backup ]; then
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::backup requiere version con formato X.Y.Z"
+              exit 1
+            fi
+          else
+            if [[ ! "$BACKUP_NAME" =~ ^[A-Za-z0-9._|-]+$ ]]; then
+              echo "::error::backup-name no es valido"
+              exit 1
+            fi
+            if [ "$CONFIRMATION" != "RESTAURAR-$ENVIRONMENT" ]; then
+              echo "::error::confirmacion incorrecta: escribe exactamente RESTAURAR-$ENVIRONMENT"
+              exit 1
+            fi
+            if [ "$ENVIRONMENT" = prod ] && [ -z "${REASON// /}" ]; then
+              echo "::error::reason es obligatorio para restaurar en prod"
+              exit 1
+            fi
+            if [ "$DATABASE" = mongo ] && [[ ! "$BACKUP_RUN_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::backup-run-id debe ser el id numerico de la ejecucion que genero la copia (mongo)"
+              exit 1
+            fi
+          fi
+          echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
+
+  backup:
+    name: backup
+    needs: preflight
+    if: needs.preflight.outputs.operation == 'backup'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    # deployment: false usa los secretos y variables del entorno sin crear un deployment (no infla el KPI de despliegues)
+    environment:
+      name: ${{ inputs.environment }}
+      deployment: false
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      backup-name: ${{ steps.mongo.outputs.backup-name || steps.aap.outputs.backup-name }}
+    env:
+      DATABASE: ${{ inputs.database }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      RETENTION_DAYS: ${{ inputs.retention-days || 30 }}
+      DB_URL: ${{ vars.DB_URL }}
+      DB_SCHEMA: ${{ vars.DB_SCHEMA }}
+      DB_PORT: ${{ vars.DB_PORT }}
+      DB_USERNAME: ${{ secrets.SEC_DB_USERNAME }}
+      DB_PASSWORD: ${{ secrets.SEC_DB_PASSWORD }}
+      MONGO_TOOLS_IMAGE: ${{ vars.MONGO_TOOLS_IMAGE }}
+      DB_CREATE_PROCEDURE: ${{ vars.DB_CREATE_PROCEDURE }}
+      DB_TABLE_EXPORT_RESTORE: ${{ vars.DB_TABLE_EXPORT_RESTORE }}
+      AAP_URL: ${{ vars.AAP_URL }}
+      AAP_TEMPLATE_BACKUP_ID: ${{ vars.AAP_TEMPLATE_BACKUP_ID }}
+      AAP_TOKEN: ${{ secrets.SEC_AAP_TOKEN }}
+    steps:
+      - name: Backup MongoDB (mongodump)
+        id: mongo
+        if: ${{ inputs.database == 'mongo' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${MONGO_TOOLS_IMAGE:?falta la variable MONGO_TOOLS_IMAGE (imagen de mongodb-database-tools fijada por digest)}"
+          NAME="backup-mongo-${ENVIRONMENT}-${VERSION}-$(date -u +%Y%m%dT%H%M%SZ)"
+          OUT="$RUNNER_TEMP/backup"
+          mkdir -p "$OUT"
+          docker run --rm -v "$OUT:/out" "$MONGO_TOOLS_IMAGE" \
+            mongodump --uri "$DB_URL" --username "$DB_USERNAME" --password "$DB_PASSWORD" \
+            --gzip --archive="/out/$NAME.archive.gz"
+          (cd "$OUT" && sha256sum "$NAME.archive.gz" > "$NAME.sha256")
+          echo "backup-name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Copia creada: $NAME"
+
+      - name: Subir copia MongoDB como artifact
+        if: ${{ inputs.database == 'mongo' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.mongo.outputs.backup-name }}
+          path: ${{ runner.temp }}/backup/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days || 30 }}
+
+      - name: Backup PostgreSQL (job AAP)
+        id: aap
+        if: ${{ inputs.database == 'postgres' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AAP_URL:?falta la variable AAP_URL}"
+          : "${AAP_TEMPLATE_BACKUP_ID:?falta la variable AAP_TEMPLATE_BACKUP_ID}"
+          : "${AAP_TOKEN:?falta el secreto SEC_AAP_TOKEN en el entorno $ENVIRONMENT}"
+          api() { # $1 metodo, $2 ruta, $3 fichero JSON opcional. El token va por stdin, no en argumentos
+            local args=(-sS -X "$1" -H "Content-Type: application/json" -K -)
+            if [ -n "${3:-}" ]; then args+=(--data "@$3"); fi
+            printf 'header = "Authorization: Bearer %s"\n' "$AAP_TOKEN" | curl "${args[@]}" "$AAP_URL$2"
+          }
+          BODY="$RUNNER_TEMP/aap-backup.json"
+          trap 'rm -f "$BODY"' EXIT
+          # extra_vars equivalentes a ansible_backup.groovy (user_action create)
+          jq -n --arg v "$VERSION" --arg env "$ENVIRONMENT" --arg user "$DB_USERNAME" --arg port "$DB_PORT" \
+            --arg proc "$DB_CREATE_PROCEDURE" --arg tbl "$DB_TABLE_EXPORT_RESTORE" --arg schema "$DB_SCHEMA" \
+            '{extra_vars: {user_action: "create", db_user: $user, ldb_port: $port, db_schema: $schema,
+              db_create_procedure: $proc, table_export_restore: $tbl,
+              atria_backend_version: $v, target_environment: $env}}' > "$BODY"
+          JOB=$(api POST "/api/controller/v2/job_templates/$AAP_TEMPLATE_BACKUP_ID/launch/" "$BODY" | jq -r '.job // empty')
+          if [ -z "$JOB" ]; then echo "::error::AAP no devolvio id de job"; exit 1; fi
+          STATUS=""
+          for _ in $(seq 1 180); do
+            STATUS=$(api GET "/api/controller/v2/jobs/$JOB/" | jq -r '.status')
+            case "$STATUS" in successful|failed|error|canceled) break ;; esac
+            sleep 20
+          done
+          if [ "$STATUS" != successful ]; then echo "::error::job AAP $JOB termino con estado $STATUS"; exit 1; fi
+          # Assumption to verify on pilot: the AAP job publishes created_backup via set_stats (Jenkins: ansible_export_created_backup)
+          CREATED=$(api GET "/api/controller/v2/jobs/$JOB/" | jq -r '.artifacts.created_backup // empty')
+          if [ -z "$CREATED" ]; then echo "::error::el job AAP $JOB no devolvio el nombre de la copia"; exit 1; fi
+          echo "backup-name=$CREATED" >> "$GITHUB_OUTPUT"
+          echo "Copia AAP creada: $CREATED"
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        env:
+          # Dato externo (AAP): se pasa por variable de entorno, no interpolado en el script
+          COPIA: ${{ steps.mongo.outputs.backup-name || steps.aap.outputs.backup-name || 'no creada' }}
+        run: |
+          {
+            echo "### Backup de BBDD"
+            echo "- Motor: \`$DATABASE\`"
+            echo "- Entorno: \`$ENVIRONMENT\`"
+            echo "- Version: \`$VERSION\`"
+            echo "- Copia: \`$COPIA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  restore:
+    name: restore
+    needs: preflight
+    if: needs.preflight.outputs.operation == 'restore'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    # El entorno exige aprobacion humana en prod (required reviewers, prevent self-review)
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read       # descargar el artifact de la copia desde otra ejecucion (mongo)
+      deployments: write  # registra la restauracion en la Deployments API
+    env:
+      DATABASE: ${{ inputs.database }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      BACKUP_NAME: ${{ inputs.backup-name }}
+      BACKUP_RUN_ID: ${{ inputs.backup-run-id }}
+      REASON: ${{ inputs.reason }}
+      DB_URL: ${{ vars.DB_URL }}
+      DB_PORT: ${{ vars.DB_PORT }}
+      DB_USERNAME: ${{ secrets.SEC_DB_USERNAME }}
+      DB_PASSWORD: ${{ secrets.SEC_DB_PASSWORD }}
+      MONGO_TOOLS_IMAGE: ${{ vars.MONGO_TOOLS_IMAGE }}
+      DB_RESTORE_PROCEDURE: ${{ vars.DB_RESTORE_PROCEDURE }}
+      DB_TABLE_EXPORT_RESTORE: ${{ vars.DB_TABLE_EXPORT_RESTORE }}
+      DB_SCHEMA: ${{ vars.DB_SCHEMA }}
+      AAP_URL: ${{ vars.AAP_URL }}
+      AAP_TEMPLATE_RESTORE_ID: ${{ vars.AAP_TEMPLATE_RESTORE_ID }}
+      AAP_TOKEN: ${{ secrets.SEC_AAP_TOKEN }}
+    steps:
+      - name: Descargar copia MongoDB
+        if: ${{ inputs.database == 'mongo' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.backup-name }}
+          run-id: ${{ inputs.backup-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/restore
+
+      - name: Restaurar MongoDB (mongorestore --drop)
+        if: ${{ inputs.database == 'mongo' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${MONGO_TOOLS_IMAGE:?falta la variable MONGO_TOOLS_IMAGE}"
+          IN="$RUNNER_TEMP/restore"
+          (cd "$IN" && sha256sum -c "$BACKUP_NAME.sha256")
+          docker run --rm -v "$IN:/in:ro" "$MONGO_TOOLS_IMAGE" \
+            mongorestore --uri "$DB_URL" --username "$DB_USERNAME" --password "$DB_PASSWORD" \
+            --drop --gzip --archive="/in/$BACKUP_NAME.archive.gz"
+          echo "Restauracion MongoDB completada desde $BACKUP_NAME"
+
+      - name: Restaurar PostgreSQL (job AAP)
+        if: ${{ inputs.database == 'postgres' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AAP_URL:?falta la variable AAP_URL}"
+          : "${AAP_TEMPLATE_RESTORE_ID:?falta la variable AAP_TEMPLATE_RESTORE_ID}"
+          : "${AAP_TOKEN:?falta el secreto SEC_AAP_TOKEN en el entorno $ENVIRONMENT}"
+          api() { # $1 metodo, $2 ruta, $3 fichero JSON opcional. El token va por stdin, no en argumentos
+            local args=(-sS -X "$1" -H "Content-Type: application/json" -K -)
+            if [ -n "${3:-}" ]; then args+=(--data "@$3"); fi
+            printf 'header = "Authorization: Bearer %s"\n' "$AAP_TOKEN" | curl "${args[@]}" "$AAP_URL$2"
+          }
+          BODY="$RUNNER_TEMP/aap-restore.json"
+          trap 'rm -f "$BODY"' EXIT
+          # extra_vars equivalentes a ansible_restore.groovy (user_action restore).
+          # Simplificacion: la copia se indica directamente; Jenkins la resuelve antes con un job "check".
+          jq -n --arg user "$DB_USERNAME" --arg port "$DB_PORT" --arg proc "$DB_RESTORE_PROCEDURE" \
+            --arg tbl "$DB_TABLE_EXPORT_RESTORE" --arg env "$ENVIRONMENT" --arg backup "$BACKUP_NAME" --arg schema "$DB_SCHEMA" \
+            '{extra_vars: {user_action: "restore", db_user: $user, ldb_port: $port, db_schema: $schema,
+              db_restore_procedure: $proc, table_export_restore: $tbl,
+              backup_name: $backup, target_environment: $env}}' > "$BODY"
+          JOB=$(api POST "/api/controller/v2/job_templates/$AAP_TEMPLATE_RESTORE_ID/launch/" "$BODY" | jq -r '.job // empty')
+          if [ -z "$JOB" ]; then echo "::error::AAP no devolvio id de job"; exit 1; fi
+          STATUS=""
+          for _ in $(seq 1 180); do
+            STATUS=$(api GET "/api/controller/v2/jobs/$JOB/" | jq -r '.status')
+            case "$STATUS" in successful|failed|error|canceled) break ;; esac
+            sleep 20
+          done
+          if [ "$STATUS" != successful ]; then echo "::error::job AAP de restauracion $JOB termino con estado $STATUS"; exit 1; fi
+          echo "Restauracion PostgreSQL completada desde $BACKUP_NAME"
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Restauracion de BBDD"
+            echo "- Motor: \`$DATABASE\`"
+            echo "- Entorno: \`$ENVIRONMENT\`"
+            echo "- Copia restaurada: \`$BACKUP_NAME\`"
+            echo "- Motivo: ${REASON:-no indicado}"
+            echo "- Ejecutado por: \`$GITHUB_ACTOR\`"
+          } >> "$GITHUB_STEP_SUMMARY"

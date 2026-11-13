@@ -1,0 +1,269 @@
+# Revisor de seguridad de PR (GitHub App devsecops-security-reviewer). Workflow reutilizable.
+#
+# Contratos (PLAN.md 2.8 y WS5):
+#   - Se invoca desde un caller con `on: workflow_run` sobre el workflow "Security" (ver README.md).
+#     Un workflow reutilizable no puede disparase por sí mismo, por eso recibe el run-id.
+#   - Lee los SARIF del run de Security (artefactos codeql-sarif y gitleaks-sarif), el estado de sus
+#     jobs y las dependencias añadidas por el PR. No ejecuta código del PR: solo lee datos.
+#   - Publica o actualiza un único comentario con marcador <!-- security-reviewer -->.
+#   - No bloquea. El bloqueo lo hacen los checks Security / * (WS3).
+#   - En PR desde fork o con commits posteriores al run no publica (queda en el resumen del job).
+#
+# Permisos: el bloque de nivel superior es el mínimo. `actions: read` es necesario para leer
+# los artefactos y jobs del run de workflow_run. La App debe concederlo; se pide en governance/apps/
+# (ver README.md). dependabot_alerts, secret_scanning_alerts y checks no son necesarios.
+# Acciones de terceros fijadas por SHA. El resto del trabajo lo hace `gh` (preinstalado en el runner).
+
+name: Security reviewer
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: 'ID del run del workflow Security que se revisa (github.event.workflow_run.id).'
+        type: string
+        required: true
+      pr-number:
+        description: 'Número del PR asociado al run (github.event.workflow_run.pull_requests[0].number).'
+        type: string
+        required: true
+      head-sha:
+        description: 'SHA del head del PR que se analizó (github.event.workflow_run.head_sha).'
+        type: string
+        required: true
+      exceptions-path:
+        description: 'Ruta del registro de excepciones en el repo que se revisa, leída de la rama base del PR.'
+        type: string
+        required: false
+        default: 'security/exceptions.yml'
+      scripts-repository:
+        description: 'owner/repo que contiene bots/security-reviewer/. Vacío = repositorio que llama.'
+        type: string
+        required: false
+        default: ''
+      scripts-ref:
+        description: 'Ref o SHA de los scripts del revisor. Vacío = mismo commit que este workflow.'
+        type: string
+        required: false
+        default: ''
+      appsec-team:
+        description: 'Equipo de AppSec (slug o org/slug) al que se pide revisión si hay críticos abiertos. Vacío = usa vars.APPSEC_TEAM; si tampoco existe, no se pide revisión.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      app-token:
+        description: 'Token de corta duración de la GitHub App devsecops-security-reviewer (opcional). Si no se pasa, se usa GITHUB_TOKEN.'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write            # etiquetas del PR (security:critical); la API de labels de PR usa issues
+  security-events: read
+  actions: read
+
+jobs:
+  review:
+    name: Security reviewer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      security-events: read
+      actions: read
+    # Un solo comentario por PR: no se solapan dos ejecuciones que lo actualicen.
+    concurrency:
+      group: security-reviewer-${{ inputs.pr-number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.app-token || github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ inputs.pr-number }}
+      RUN_ID: ${{ inputs.run-id }}
+      HEAD_SHA: ${{ inputs.head-sha }}
+      EXC_PATH: ${{ inputs.exceptions-path }}
+      APPSEC_TEAM: ${{ inputs.appsec-team || vars.APPSEC_TEAM }}
+    steps:
+      - name: Descargar scripts del revisor (sin código del PR)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.scripts-repository || github.repository }}
+          ref: ${{ inputs.scripts-ref || github.workflow_sha }}
+          sparse-checkout: bots/security-reviewer
+          path: reviewer
+          persist-credentials: false
+
+      - name: Validar entradas y comprobar que el PR sigue en ese commit
+        id: gate
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run-id no válido"; exit 1; }
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::pr-number no válido"; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::head-sha no válido"; exit 1; }
+
+          pr_json="$(gh api "repos/${REPO}/pulls/${PR}")"
+          cur_head="$(jq -r '.head.sha' <<<"$pr_json")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr_json")"
+          base_sha="$(jq -r '.base.sha' <<<"$pr_json")"
+
+          publish=true
+          motivo=""
+          if [ "$head_repo" != "$REPO" ]; then
+            publish=false
+            motivo="PR desde fork: no se publica comentario (PLAN 2.8)."
+          elif [ "$cur_head" != "$HEAD_SHA" ]; then
+            publish=false
+            motivo="El PR tiene commits posteriores a ${HEAD_SHA}: resumen obsoleto, no se publica."
+          fi
+
+          echo "::notice::${motivo:-Publicación permitida.}"
+          [ -n "$motivo" ] && echo "> ${motivo}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "publish=${publish}"
+            echo "base-sha=${base_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Descargar SARIF y estado de los jobs del run de Security
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/codeql" "$WORK/gitleaks"
+          gh api --paginate "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | .name' > "$WORK/artifacts.txt"
+
+          if grep -qx 'codeql-sarif' "$WORK/artifacts.txt"; then
+            gh run download "$RUN_ID" --repo "$REPO" --name codeql-sarif --dir "$WORK/codeql"
+          else
+            echo "::warning::El run ${RUN_ID} no tiene el artefacto codeql-sarif."
+            rm -rf "$WORK/codeql"
+          fi
+
+          if grep -qx 'gitleaks-sarif' "$WORK/artifacts.txt"; then
+            gh run download "$RUN_ID" --repo "$REPO" --name gitleaks-sarif --dir "$WORK/gitleaks"
+          else
+            echo "::warning::El run ${RUN_ID} no tiene el artefacto gitleaks-sarif."
+            rm -rf "$WORK/gitleaks"
+          fi
+
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" > "$WORK/jobs.json"
+
+      - name: Obtener dependencias añadidas, ficheros del PR y excepciones (opcionales)
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+          BASE_SHA: ${{ steps.gate.outputs.base-sha }}
+        run: |
+          set -uo pipefail
+
+          if ! gh api "repos/${REPO}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}" > "$WORK/deps.json" 2> "$WORK/deps.err"; then
+            rm -f "$WORK/deps.json"
+            echo "::warning::Dependency graph no disponible: $(head -c 200 "$WORK/deps.err")"
+          fi
+
+          if ! gh api --paginate "repos/${REPO}/pulls/${PR}/files?per_page=100" --jq '.[].filename' > "$WORK/changed.txt"; then
+            rm -f "$WORK/changed.txt"
+            echo "::warning::No se pudo listar los ficheros del PR."
+          fi
+
+          # Registro de excepciones de la rama base (no del PR: un PR no puede silenciarse a sí mismo).
+          if gh api "repos/${REPO}/contents/${EXC_PATH}?ref=${BASE_SHA}" --jq '.content' | base64 -d > "$WORK/exceptions.yml" 2>/dev/null; then
+            echo "Registro de excepciones leído de la rama base."
+          else
+            rm -f "$WORK/exceptions.yml"
+            echo "::notice::Sin registro de excepciones en la rama base; no se silencia nada."
+          fi
+
+      - name: Generar resumen Markdown
+        id: summary
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPO" --sha "$HEAD_SHA" --pr "$PR" --out "$WORK/comment.md" --critical-out "$WORK/critical.txt")
+          [ -d "$WORK/codeql" ] && args+=(--codeql "$WORK/codeql")
+          [ -d "$WORK/gitleaks" ] && args+=(--gitleaks "$WORK/gitleaks")
+          [ -f "$WORK/jobs.json" ] && args+=(--jobs "$WORK/jobs.json")
+          [ -f "$WORK/deps.json" ] && args+=(--deps "$WORK/deps.json")
+          [ -f "$WORK/changed.txt" ] && args+=(--changed "$WORK/changed.txt")
+          [ -f "$WORK/exceptions.yml" ] && args+=(--exceptions "$WORK/exceptions.yml")
+          node reviewer/bots/security-reviewer/scripts/summarize.mjs "${args[@]}"
+          cat "$WORK/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "critical=$(cat "$WORK/critical.txt")" >> "$GITHUB_OUTPUT"
+
+      # Aviso a AppSec: etiqueta security:critical mientras haya críticos abiertos. La revisión de
+      # equipo solo se pide si APPSEC_TEAM está definida. No bloquea: los fallos solo avisan.
+      - name: Etiqueta security:critical y revisión de AppSec (opcional)
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+          CRITICAL: ${{ steps.summary.outputs.critical }}
+        run: |
+          set -uo pipefail
+          label='security:critical'
+          if [ "${CRITICAL:-0}" -gt 0 ]; then
+            gh api -X POST "repos/${REPO}/labels" -f name="$label" -f color=B60205 \
+              -f description='Hallazgos de seguridad críticos abiertos' > /dev/null 2>&1 || true
+            if gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=${label}" > /dev/null; then
+              echo "Etiqueta ${label} aplicada."
+            else
+              echo "::warning::No se pudo aplicar la etiqueta ${label}."
+            fi
+
+            if [ -n "${APPSEC_TEAM:-}" ]; then
+              if [[ "$APPSEC_TEAM" =~ ^([A-Za-z0-9_.-]+/)?[A-Za-z0-9_-]+$ ]]; then
+                slug="${APPSEC_TEAM##*/}"
+                if gh api -X POST "repos/${REPO}/pulls/${PR}/requested_reviewers" -f "team_reviewers[]=${slug}" > /dev/null; then
+                  echo "Revisión solicitada al equipo ${slug}."
+                else
+                  echo "::warning::No se pudo solicitar revisión al equipo ${slug}."
+                fi
+              else
+                echo "::warning::APPSEC_TEAM no tiene un formato válido; no se solicita revisión."
+              fi
+            else
+              echo "APPSEC_TEAM sin definir: solo etiqueta y aviso, sin solicitud de revisión."
+            fi
+          else
+            gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/security%3Acritical" > /dev/null 2>&1 || true
+            echo "Sin críticos abiertos: etiqueta ${label} retirada si existía."
+          fi
+
+      - name: Publicar o actualizar el comentario del PR
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+        run: |
+          set -euo pipefail
+          id="$(gh api --paginate "repos/${REPO}/issues/${PR}/comments?per_page=100" \
+            --jq '.[] | select(.body | contains("<!-- security-reviewer -->")) | .id' | sed -n '1p')"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@"$WORK/comment.md" > /dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" -F body=@"$WORK/comment.md" > /dev/null
+          fi
+
+      - name: Aplicar o quitar la etiqueta security:critical
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}/sec
+        run: |
+          set -euo pipefail
+          # La etiqueta refleja el estado actual: se añade si hay críticos abiertos y se quita si no.
+          if grep -q '^### Crítico (0)$' "$WORK/comment.md"; then
+            gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/security%3Acritical" > /dev/null 2>&1 || true
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f 'labels[]=security:critical' > /dev/null
+          fi

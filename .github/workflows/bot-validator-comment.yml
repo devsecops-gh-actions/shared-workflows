@@ -1,0 +1,87 @@
+# Publicación del resumen del validador para PRs desde fork (workflow reutilizable).
+#
+# Lo llama un workflow_run (ver examples/caller-comment.yml) que se dispara cuando termina el
+# workflow de validación del PR. Este job NO ejecuta código del PR: solo descarga el artefacto
+# "validator-reports" del run indicado, comprueba que corresponde al mismo commit del PR y
+# publica el comentario con los scripts del repo de plataforma (no del fork).
+#
+# Debe vivir en .github/workflows/ del repo que contiene el wrapper de workflow_run (ver README.md).
+
+name: Validation comment
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: 'ID del run de validación (github.event.workflow_run.id).'
+        type: string
+        required: true
+      head-sha:
+        description: 'SHA del commit del PR (github.event.workflow_run.head_sha).'
+        type: string
+        required: true
+      validator-repository:
+        description: 'owner/repo con bots/validator/. Vacío = repositorio que llama.'
+        type: string
+        required: false
+        default: ''
+      validator-ref:
+        description: 'Ref o SHA de los scripts. Vacío = mismo commit que este workflow.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      app-token:
+        description: 'Token de la GitHub App devsecops-validator (opcional). Si no se pasa, GITHUB_TOKEN.'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Descargar scripts del validador (código del repo base, no del fork)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.validator-repository || github.repository }}
+          ref: ${{ inputs.validator-ref || github.workflow_sha }}
+          sparse-checkout: bots/validator
+          path: validator
+          persist-credentials: false
+
+      - name: Descargar informes del run de validación
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: validator-reports
+          path: ${{ runner.temp }}/in
+          run-id: ${{ inputs.run-id }}
+          github-token: ${{ secrets.app-token || github.token }}
+
+      # El artefacto viene de un PR externo: se valida su contenido antes de usarlo.
+      # Solo se acepta un entero como número de PR y el SHA debe coincidir con el del run.
+      - name: Validar metadatos y publicar comentario
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.app-token || github.token }}
+          EXPECTED_SHA: ${{ inputs.head-sha }}
+          META_FILE: ${{ runner.temp }}/in/pr.json
+        run: |
+          set -euo pipefail
+          meta="$(node -e '
+            const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            if (!Number.isInteger(m.number) || m.number < 1 || typeof m.head_sha !== "string") process.exit(1);
+            process.stdout.write(m.number + " " + m.head_sha);
+          ' "$META_FILE")" || { echo "pr.json no válido"; exit 1; }
+          read -r pr sha <<< "$meta"
+          if [ "$sha" != "$EXPECTED_SHA" ]; then
+            echo "El SHA del artefacto no coincide con el SHA del run de validación"
+            exit 1
+          fi
+          node validator/bots/validator/scripts/validate.mjs --publish --pr "$pr" \
+            --report "$RUNNER_TEMP/in/report-conventions.md" \
+            --report "$RUNNER_TEMP/in/report-workflows.md"

@@ -1,0 +1,227 @@
+# ci-go.yml
+# Workflow reutilizable: vet, tests y build de modulos Go.
+# Aplicacion: binario estatico (linux/amd64) por cada paquete main. Libreria: archivo fuente del modulo.
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI Go
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Subcarpeta del modulo (monorepos). Relativa a la raiz del repo.
+        type: string
+        default: '.'
+      matrix:
+        description: 'JSON con combinaciones de runtime. Clave `go`. Ej.: {"go":["1.24","1.25"]}. Se fusiona con el valor por defecto.'
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` (binarios) o `library` (archivo fuente del modulo).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar `go test ./...` en la matriz.
+        type: boolean
+        default: true
+      publish:
+        description: Solo `library`. Valida tag vX.Y.Z. Go publica implicitamente por tag; no sube nada (publish-package.yml valida el tag).
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+    outputs:
+      version:
+        description: Version semver (2.4).
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido.
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta del artefacto principal (binario o tar.gz de fuentes) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+      package-id:
+        description: Solo library. `modulo@vX.Y.Z`.
+        value: ${{ jobs.build-and-test.outputs.package-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      primary: ${{ steps.matrix.outputs.primary }}
+    steps:
+      - name: Fusionar matriz con valores por defecto
+        id: matrix
+        env:
+          INPUT_MATRIX: ${{ inputs.matrix || '{}' }}
+        run: |
+          set -euo pipefail
+          defaults='{"go":["1.25"]}'
+          m=$(jq -cn --argjson d "$defaults" --argjson i "$INPUT_MATRIX" '$d * $i')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "primary=$(jq -r '.go[0]' <<< "$m")" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    if: ${{ inputs.run-tests }}
+    runs-on: ${{ matrix.os || fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Go y cache de modulos
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Verificar modulo y descargar dependencias
+        run: |
+          set -euo pipefail
+          [ -f go.mod ] && [ -f go.sum ] || { echo "::error::Faltan go.mod y go.sum (obligatorios)."; exit 1; }
+          go mod download
+          go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Tests
+        if: ${{ inputs.run-tests }}
+        run: go test -count=1 ./...
+
+  build-and-test:
+    name: build-and-test
+    needs: [prepare, test]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      artifact-path: ${{ steps.pkg.outputs.artifact-path }}
+      package-id: ${{ steps.pkg.outputs.package-id }}
+    steps:
+      - name: Comprobar resultado de tests
+        working-directory: .
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$TEST_RESULT" != "success" ] && [ "$TEST_RESULT" != "skipped" ]; then
+            echo "::error::El job test ha terminado con '$TEST_RESULT'."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Go (runtime principal) y cache de modulos
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ needs.prepare.outputs.primary }}
+          cache: true
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Verificar modulo y descargar dependencias
+        run: |
+          set -euo pipefail
+          [ -f go.mod ] && [ -f go.sum ] || { echo "::error::Faltan go.mod y go.sum (obligatorios)."; exit 1; }
+          go mod download
+          go mod verify
+
+      - name: Calcular version y nombre de artefacto
+        id: meta
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          # Go no tiene version en el manifiesto: la version base es 0.0.0 y la fija el tag.
+          base="0.0.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            [ "$KIND" = "library" ] || { echo "::error::publish=true solo aplica a kind=library."; exit 1; }
+            [[ "$GITHUB_REF" == refs/tags/v* ]] || { echo "::error::publish=true requiere un tag v*."; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = "library" ]; then
+            go build ./...
+          else
+            # Un binario por paquete main. Estatico: CGO_ENABLED=0, linux/amd64.
+            out="$GITHUB_WORKSPACE/artifacts"; mkdir -p "$out"
+            for pkg in $(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./...); do
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+                -ldflags "-s -w -X main.version=$VERSION" -o "$out/$(basename "$pkg")" "$pkg"
+            done
+          fi
+
+      - name: Empaquetar
+        id: pkg
+        env:
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$out"
+          if [ "$KIND" = "library" ]; then
+            main="$out/$ARTIFACT_NAME.tar.gz"
+            tar -czf "$main" --exclude=.git --exclude=artifacts -C "$PWD" .
+            mod=$(go list -m)
+            echo "package-id=$mod@v$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            main=$(ls "$out" | head -n1)
+            [ -n "$main" ] || { echo "::error::No se ha generado ningun binario (no hay paquetes main)."; exit 1; }
+            main="$out/$main"
+            echo "package-id=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "artifact-path=artifacts/$(basename "$main")" >> "$GITHUB_OUTPUT"
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

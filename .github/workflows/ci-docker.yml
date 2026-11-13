@@ -1,0 +1,220 @@
+# ci-docker.yml
+# Workflow reutilizable: build de imagen de contenedor con Docker Buildx, tests de contenedor,
+# Publicacion opcional en GHCR por digest. El SBOM y la atestacion los genera supply-chain.yml.
+# Contrato: docs en pipelines/build/README.md. Check requerido: <caller>/build-and-test.
+name: CI Docker
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Carpeta base del proyecto. `context` y `dockerfile` se resuelven desde aqui.
+        type: string
+        default: '.'
+      matrix:
+        description: Reservado. Este stack no tiene matriz de runtime; se acepta por uniformidad y se ignora.
+        type: string
+        default: '{}'
+      kind:
+        description: '`application` o `library` (una imagen se trata como aplicacion; el valor queda registrado).'
+        type: string
+        required: true
+      run-tests:
+        description: Ejecutar `test-command` dentro de la imagen construida.
+        type: boolean
+        default: true
+      publish:
+        description: Aceptado por uniformidad y ignorado en este stack. La publicacion de librerias es de publish-package.yml.
+        type: boolean
+        default: false
+      runner:
+        description: 'JSON: etiqueta de runner (`"ubuntu-latest"`) o array para self-hosted.'
+        type: string
+        default: '"ubuntu-latest"'
+      context:
+        description: Contexto de build, relativo a working-directory.
+        type: string
+        default: '.'
+      dockerfile:
+        description: Ruta del Dockerfile, relativa a working-directory.
+        type: string
+        default: Dockerfile
+      platforms:
+        description: 'Plataformas (coma). Con push=false solo se admite una (la imagen se carga en el daemon local).'
+        type: string
+        default: linux/amd64
+      image-name:
+        description: 'Nombre de imagen sin registro. Vacio = `owner/repo` en minusculas.'
+        type: string
+        default: ''
+      registry:
+        description: Registro de destino. Con push=true, el login usa GITHUB_TOKEN, valido solo para ghcr.io.
+        type: string
+        default: ghcr.io
+      push:
+        description: Publicar la imagen en el registro. Solo en release/main; los PR no publican.
+        type: boolean
+        default: false
+      build-args:
+        description: Build args, uno por linea (`CLAVE=valor`).
+        type: string
+        default: ''
+      test-command:
+        description: Comando a ejecutar dentro de la imagen (`sh -c`). Vacio = sin tests de contenedor.
+        type: string
+        default: ''
+    outputs:
+      version:
+        description: Version semver (2.4). Las etiquetas de imagen usan el mismo valor con `+` sustituido por `-`.
+        value: ${{ jobs.build-and-test.outputs.version }}
+      artifact-name:
+        description: Nombre del artefacto subido (contiene image-ref.txt y, si push=false, image.tar para container.yml).
+        value: ${{ jobs.build-and-test.outputs.artifact-name }}
+      artifact-path:
+        description: Ruta de image-ref.txt (referencia de la imagen) relativa a la raiz del repo.
+        value: ${{ jobs.build-and-test.outputs.artifact-path }}
+      image-name:
+        description: '`<registry>/<repo>` (sin tag ni digest).'
+        value: ${{ jobs.build-and-test.outputs.image-name }}
+      image-digest:
+        description: '`sha256:...`. Vacio si push=false (la imagen no tiene digest de registro).'
+        value: ${{ jobs.build-and-test.outputs.image-digest }}
+      image-tag:
+        description: Referencia local (IMAGE:TAG) cargada desde image.tar. Vacia si push=true. Obligatoria para container.yml en PR.
+        value: ${{ jobs.build-and-test.outputs.image-tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    # packages: write solo se usa si push=true. GitHub valida los permisos del job llamado contra el caller:
+    # el caller debe conceder packages: write (ver examples/caller.yml).
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.meta-version.outputs.version }}
+      artifact-name: ${{ steps.meta-version.outputs.artifact-name }}
+      artifact-path: ${{ steps.ref.outputs.artifact-path }}
+      image-name: ${{ steps.ref.outputs.image-name }}
+      image-digest: ${{ steps.ref.outputs.image-digest }}
+      image-tag: ${{ steps.ref.outputs.image-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Calcular version, nombre de imagen y etiqueta
+        id: meta-version
+        env:
+          PUSH: ${{ inputs.push }}
+          KIND: ${{ inputs.kind }}
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_INPUT: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          base="0.0.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag no valido '$GITHUB_REF_NAME' (se espera vX.Y.Z)."; exit 1; }
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+            version="${base}-${branch}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:7}"
+          fi
+          if [ "$PUSH" = "true" ] && [ "$REGISTRY" != "ghcr.io" ]; then
+            echo "::error::push=true con registry '$REGISTRY' requiere login por OIDC (no soportado en este workflow). Ver README."
+            exit 1
+          fi
+          repo="${IMAGE_INPUT:-${GITHUB_REPOSITORY,,}}"
+          image="$REGISTRY/$repo"
+          tag="${version//+/-}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${GITHUB_REPOSITORY##*/}-$version" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login en el registro (solo push)
+        if: ${{ inputs.push }}
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadatos (etiquetas OCI y tag)
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
+        with:
+          images: ${{ steps.meta-version.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.meta-version.outputs.tag }}
+            type=sha,format=short
+
+      - name: Build (y push si corresponde)
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ inputs.working-directory }}/${{ inputs.context }}
+          file: ${{ inputs.working-directory }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build-args }}
+          push: ${{ inputs.push }}
+          load: ${{ !inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolver referencia de la imagen
+        id: ref
+        env:
+          PUSH: ${{ inputs.push }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.meta-version.outputs.image }}
+          TAG: ${{ steps.meta-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = "true" ]; then
+            [ -n "$DIGEST" ] || { echo "::error::push=true pero build-push-action no ha devuelto digest."; exit 1; }
+            ref="$IMAGE@$DIGEST"
+            docker pull "$ref" >/dev/null
+          else
+            ref="$IMAGE:$TAG"
+            DIGEST=""
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          echo "$ref" > "$GITHUB_WORKSPACE/artifacts/image-ref.txt"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "image-name=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image-digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          if [ "$PUSH" != "true" ]; then
+            docker save "$ref" -o "$GITHUB_WORKSPACE/artifacts/image.tar"
+            echo "image-tag=$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "image-tag=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "artifact-path=artifacts/image-ref.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Tests de contenedor
+        if: ${{ inputs.run-tests && inputs.test-command != '' }}
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh "$REF" -c "$TEST_COMMAND"
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta-version.outputs.artifact-name }}
+          path: artifacts/
+          if-no-files-found: error

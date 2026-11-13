@@ -1,0 +1,85 @@
+# Workflow reutilizable de análisis de IaC (WS3).
+# Check que produce (contrato PLAN.md 2.1): IaC / scan
+# Es obligatorio solo en repos con custom property has-iac=true.
+#
+# Herramienta: Checkov (versión fijada). Cubre Terraform, Kubernetes, Bicep y CloudFormation.
+# Limitación: Checkov OSS no asigna severidad a sus checks, así que el umbral
+# "iac: high" de policy.yml no se puede aplicar por severidad. Cualquier check
+# fallido bloquea, salvo los que el caller excluya explícitamente con skip-checks
+# (esas exclusiones deben referenciar un ID de security/exceptions.yml).
+#
+# Permisos: contents read; security-events write solo para subir SARIF.
+
+name: IaC
+
+on:
+  workflow_call:
+    inputs:
+      iac-path:
+        description: 'Directorio a analizar, relativo a la raíz del repo'
+        type: string
+        required: false
+        default: '.'
+      frameworks:
+        description: 'Frameworks de Checkov separados por coma (terraform,kubernetes,bicep,cloudformation) o "all"'
+        type: string
+        required: false
+        default: 'all'
+      skip-checks:
+        description: 'IDs de checks de Checkov a excluir, separados por coma. Cada uno debe tener entrada en security/exceptions.yml.'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      # Versión fijada de Checkov (PyPI). Actualizar mediante PR revisado.
+      CHECKOV_VERSION: '3.4.5'
+      IAC_PATH: ${{ inputs.iac-path }}
+      IAC_FRAMEWORKS: ${{ inputs.frameworks }}
+      IAC_SKIP_CHECKS: ${{ inputs.skip-checks }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Checkov (versión fijada en venv)
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/checkov-venv"
+          "${RUNNER_TEMP}/checkov-venv/bin/pip" install --disable-pip-version-check "checkov==${CHECKOV_VERSION}"
+          "${RUNNER_TEMP}/checkov-venv/bin/checkov" --version
+
+      - name: Ejecutar Checkov
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "${IAC_SKIP_CHECKS}" ]; then
+            extra+=(--skip-check "${IAC_SKIP_CHECKS}")
+          fi
+          # El informe SARIF va al directorio de trabajo (hashFiles solo ve el workspace).
+          # Checkov sale con código != 0 si hay checks fallidos: el job falla y el SARIF se sube igualmente.
+          "${RUNNER_TEMP}/checkov-venv/bin/checkov" \
+            --directory "${IAC_PATH}" \
+            --framework "${IAC_FRAMEWORKS}" \
+            --output cli \
+            --output sarif \
+            --output-file-path "console,checkov-results" \
+            "${extra[@]+"${extra[@]}"}"
+
+      - name: Subir SARIF a Code scanning
+        if: always() && hashFiles('checkov-results/results_sarif.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: checkov-results/results_sarif.sarif
+          category: checkov

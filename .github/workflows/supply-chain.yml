@@ -1,0 +1,147 @@
+# supply-chain.yml
+# Workflow reutilizable: genera el SBOM (SPDX JSON) de un artefacto o imagen producido por ci-<stack>.yml
+# y, solo en main y tags, atestigua procedencia y SBOM por digest.
+# Check requerido: `supply-chain / sbom-attest` (caller con job id `supply-chain`; ver README).
+# Se ejecuta en PR para que el check exista. En PR no hay atestacion ni publicacion.
+# El SBOM NO lo genera ci-<stack>.yml: se genera aqui.
+name: Supply chain
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Nombre del artefacto subido por ci-<stack>.yml (output `artifact-name`).
+        type: string
+        required: true
+      artifact-path:
+        description: Ruta del artefacto principal relativa a la raiz del repo (output `artifact-path`). Obligatorio si no hay image-digest.
+        type: string
+        default: ''
+      image-name:
+        description: Solo docker. `<registry>/<repo>` (output `image-name` de ci-docker.yml). Solo ghcr.io.
+        type: string
+        default: ''
+      image-digest:
+        description: Solo docker. `sha256:...` (output `image-digest`). Vacio en PR (push=false). Si esta vacio, el SBOM se genera del artefacto.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-attest:
+    name: sbom-attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # id-token y attestations: firma de atestaciones (Sigstore, OIDC de GitHub). Solo se usan en main y tags.
+    # packages: write: pull de la imagen (GHCR) y push de atestaciones al registro en main y tags.
+    # El caller debe conceder estos permisos al job que llama a este workflow.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
+    steps:
+      - name: Validar entradas y modo
+        id: mode
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$IMAGE_DIGEST" ]; then
+            [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::image-digest invalido: '$IMAGE_DIGEST'"; exit 1; }
+            [[ "$IMAGE_NAME" == ghcr.io/* ]] || { echo "::error::Solo ghcr.io esta soportado para imagenes."; exit 1; }
+            echo "subject=image" >> "$GITHUB_OUTPUT"
+          else
+            [ -n "$ARTIFACT_PATH" ] || { echo "::error::artifact-path es obligatorio si no hay image-digest."; exit 1; }
+            echo "subject=artifact" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$GITHUB_REF" == "refs/heads/main" || "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "attest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Descargar artefacto de build
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: artifacts
+
+      - name: Verificar artefacto
+        if: ${{ steps.mode.outputs.subject == 'artifact' }}
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          set -euo pipefail
+          [ -f "$ARTIFACT_PATH" ] || { echo "::error::Artefacto no encontrado tras la descarga: '$ARTIFACT_PATH'"; exit 1; }
+
+      - name: Login en GHCR (solo imagen)
+        if: ${{ steps.mode.outputs.subject == 'image' }}
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generar SBOM de la imagen por digest (SPDX JSON)
+        if: ${{ steps.mode.outputs.subject == 'image' }}
+        # JUSTIFICADO: SHA pendiente de confirmar (ver docs/actions-pinning.md, WS2).
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          image: ${{ inputs.image-name }}@${{ inputs.image-digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generar SBOM del artefacto (SPDX JSON)
+        if: ${{ steps.mode.outputs.subject == 'artifact' }}
+        # JUSTIFICADO: SHA pendiente de confirmar (ver docs/actions-pinning.md, WS2).
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          path: artifacts
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Subir SBOM al artefacto
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}-sbom
+          path: sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Atestar procedencia (imagen por digest, solo main y tags)
+        if: ${{ steps.mode.outputs.subject == 'image' && steps.mode.outputs.attest == 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image-name }}
+          subject-digest: ${{ inputs.image-digest }}
+          push-to-registry: true
+
+      - name: Atestar procedencia (artefacto, solo main y tags)
+        if: ${{ steps.mode.outputs.subject == 'artifact' && steps.mode.outputs.attest == 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ inputs.artifact-path }}
+
+      - name: Atestar SBOM (imagen por digest, solo main y tags)
+        if: ${{ steps.mode.outputs.subject == 'image' && steps.mode.outputs.attest == 'true' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ inputs.image-name }}
+          subject-digest: ${{ inputs.image-digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+
+      - name: Atestar SBOM (artefacto, solo main y tags)
+        if: ${{ steps.mode.outputs.subject == 'artifact' && steps.mode.outputs.attest == 'true' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: ${{ inputs.artifact-path }}
+          sbom-path: sbom.spdx.json

@@ -1,0 +1,292 @@
+# Rollback transversal (workflow_dispatch).
+# 1. Resuelve la versión objetivo desde la GitHub Deployments API del entorno y del target:
+#    - por defecto, la última versión exitosa distinta de la actual (la "previous-version");
+#    - o la indicada en target-version (debe existir como despliegue exitoso del mismo target).
+# 2. Registra el motivo (obligatorio en prod) como deployment con task=rollback y su auditoría.
+# 3. Reejecuta el deploy-* del target con el artifact-ref de esa versión, con strategy=rolling,
+#    usando el mismo `environment:` y, por tanto, las mismas aprobaciones de prod.
+# Nota: un workflow reutilizable no se puede elegir dinámicamente, por eso hay un job por target con `if:`.
+# Documentación: pipelines/deploy/README.md (sección Rollback)
+# Verificación T-27: este fichero no invoca CLIs propios; los comandos de k8s (kubectl rollout undo/status, helm rollback,
+# az aks install-cli, status.phase de Argo Rollouts) se verifican y documentan en pipelines/deploy/deploy-k8s.yml.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno: dev, staging o prod."
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      target:
+        description: "Target a revertir."
+        required: true
+        type: choice
+        options: [k8s, serverless, paas, vm-iac]
+      target-version:
+        description: "Versión concreta a la que volver. Vacío = la última versión exitosa anterior a la actual."
+        required: false
+        type: string
+        default: ""
+      reason:
+        description: "Motivo del rollback (obligatorio en prod)."
+        required: false
+        type: string
+        default: ""
+      health-check-url:
+        description: "URL de comprobación (obligatoria salvo vm-iac)."
+        required: false
+        type: string
+        default: ""
+      rollback-on-failure:
+        description: "Revertir de nuevo si la comprobación del rollback falla."
+        required: false
+        type: boolean
+      app-name:
+        description: "k8s: nombre de la aplicación (release de Helm)."
+        required: false
+        type: string
+        default: ""
+      cloud:
+        description: "k8s: aks, eks o gke. vm-iac: azure o aws."
+        required: false
+        type: string
+        default: ""
+      tool:
+        description: "k8s: helm o kubectl."
+        required: false
+        type: string
+        default: helm
+      platform:
+        description: "paas: azure-app-service o cloud-run."
+        required: false
+        type: string
+        default: ""
+      chart-path:
+        description: "k8s: ruta del chart."
+        required: false
+        type: string
+        default: charts/app
+      values-dir:
+        description: "k8s: directorio de values por entorno."
+        required: false
+        type: string
+        default: deploy/values
+      manifests-path:
+        description: "k8s con tool=kubectl: directorio de manifiestos."
+        required: false
+        type: string
+        default: k8s
+      iac-path:
+        description: "vm-iac: directorio raíz de Terraform."
+        required: false
+        type: string
+        default: infra/terraform
+      runner:
+        description: 'Runner en JSON (por defecto "ubuntu-latest").'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rollback-${{ inputs.environment }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    outputs:
+      version: ${{ steps.find.outputs.version }}
+      artifact-ref: ${{ steps.find.outputs.artifact-ref }}
+      current-version: ${{ steps.find.outputs.current-version }}
+      rollback-deployment-id: ${{ steps.find.outputs.rollback-deployment-id }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      TARGET: ${{ inputs.target }}
+      TARGET_VERSION: ${{ inputs.target-version }}
+      REASON: ${{ inputs.reason }}
+      HEALTH_URL: ${{ inputs.health-check-url }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      GH_ACTOR: ${{ github.actor }}
+    steps:
+      - name: Validar entradas
+        run: |
+          set -euo pipefail
+          case "$TARGET" in k8s|serverless|paas|vm-iac) ;; *) echo "::error::target no soportado"; exit 1 ;; esac
+          case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment no válido"; exit 1 ;; esac
+          if [ "$ENVIRONMENT" = "prod" ] && [ -z "$REASON" ]; then
+            echo "::error::el rollback en prod requiere reason"; exit 1
+          fi
+          if [ "$TARGET" != "vm-iac" ] && [ -z "$HEALTH_URL" ]; then
+            echo "::error::health-check-url es obligatoria para $TARGET"; exit 1
+          fi
+
+      - name: Buscar versión objetivo en la Deployments API
+        id: find
+        run: |
+          set -euo pipefail
+          current=""
+          chosen_v=""
+          chosen_ref=""
+          # TARGET ya está validado contra una lista cerrada, por eso se inserta en el filtro jq.
+          filter=".[] | select((.payload.target // \"\") == \"$TARGET\") | \"\\(.id)\\t\\(.payload|tostring)\""
+          while IFS=$'\t' read -r id payload; do
+            [ -n "$id" ] || continue
+            state=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+            [ "$state" = "success" ] || continue
+            v=$(jq -r '.version // ""' <<< "$payload")
+            r=$(jq -r '.artifact_ref // ""' <<< "$payload")
+            [ -n "$v" ] || continue
+            if [ -z "$current" ]; then current="$v"; fi
+            if [ -n "$TARGET_VERSION" ]; then
+              if [ "$v" = "$TARGET_VERSION" ]; then chosen_v="$v"; chosen_ref="$r"; break; fi
+            elif [ "$v" != "$current" ]; then
+              chosen_v="$v"; chosen_ref="$r"; break
+            fi
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=50" --jq "$filter")
+
+          if [ -z "$chosen_ref" ]; then echo "::error::no hay una versión exitosa objetivo para $TARGET en $ENVIRONMENT"; exit 1; fi
+          if [ "$chosen_v" = "$current" ]; then echo "::error::la versión objetivo ya es la actual ($current)"; exit 1; fi
+
+          payload=$(jq -cn --arg v "$chosen_v" --arg r "$chosen_ref" --arg t "$TARGET" --arg reason "$REASON" \
+            --arg from "$current" --arg by "$GH_ACTOR" \
+            '{version:$v, artifact_ref:$r, target:$t, rollback:true, rolled_back_from:$from, reason:$reason, requested_by:$by}')
+          rb_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg reason "$REASON" --argjson payload "$payload" \
+            '{ref:$sha, environment:$env, task:"rollback", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:("rollback: " + $reason)}' \
+            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+          gh api -X POST "repos/$REPO/deployments/$rb_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+
+          {
+            echo "version=$chosen_v"
+            echo "artifact-ref=$chosen_ref"
+            echo "current-version=$current"
+            echo "rollback-deployment-id=$rb_id"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Rollback $TARGET en $ENVIRONMENT"
+            echo "- Desde: \`$current\` hacia: \`$chosen_v\`"
+            echo "- Artefacto: \`$chosen_ref\`"
+            echo "- Motivo: $REASON"
+            echo "- Solicitado por: $GH_ACTOR"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollback-k8s:
+    needs: resolve
+    if: ${{ inputs.target == 'k8s' }}
+    uses: ./.github/workflows/deploy-k8s.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ needs.resolve.outputs.version }}
+      artifact-ref: ${{ needs.resolve.outputs.artifact-ref }}
+      strategy: rolling
+      health-check-url: ${{ inputs.health-check-url }}
+      rollback-on-failure: ${{ inputs.rollback-on-failure }}
+      app-name: ${{ inputs.app-name }}
+      cloud: ${{ inputs.cloud }}
+      tool: ${{ inputs.tool }}
+      chart-path: ${{ inputs.chart-path }}
+      values-dir: ${{ inputs.values-dir }}
+      manifests-path: ${{ inputs.manifests-path }}
+      runner: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      packages: read
+      attestations: read
+
+  rollback-serverless:
+    needs: resolve
+    if: ${{ inputs.target == 'serverless' }}
+    uses: ./.github/workflows/deploy-serverless.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ needs.resolve.outputs.version }}
+      artifact-ref: ${{ needs.resolve.outputs.artifact-ref }}
+      strategy: rolling
+      health-check-url: ${{ inputs.health-check-url }}
+      rollback-on-failure: ${{ inputs.rollback-on-failure }}
+      app-name: ${{ inputs.app-name }}
+      runner: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      packages: read
+      attestations: read
+
+  rollback-paas:
+    needs: resolve
+    if: ${{ inputs.target == 'paas' }}
+    uses: ./.github/workflows/deploy-paas.yml
+    with:
+      environment: ${{ inputs.environment }}
+      platform: ${{ inputs.platform }}
+      version: ${{ needs.resolve.outputs.version }}
+      artifact-ref: ${{ needs.resolve.outputs.artifact-ref }}
+      strategy: rolling
+      health-check-url: ${{ inputs.health-check-url }}
+      rollback-on-failure: ${{ inputs.rollback-on-failure }}
+      runner: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+      packages: read
+      attestations: read
+
+  rollback-vm-iac:
+    needs: resolve
+    if: ${{ inputs.target == 'vm-iac' }}
+    uses: ./.github/workflows/deploy-vm-iac.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ needs.resolve.outputs.version }}
+      artifact-ref: ${{ needs.resolve.outputs.artifact-ref }}
+      strategy: rolling
+      health-check-url: ${{ inputs.health-check-url }}
+      rollback-on-failure: ${{ inputs.rollback-on-failure }}
+      iac-path: ${{ inputs.iac-path }}
+      cloud: ${{ inputs.cloud }}
+      terraform-action: apply
+      runner: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+
+  finish:
+    needs: [resolve, rollback-k8s, rollback-serverless, rollback-paas, rollback-vm-iac]
+    if: ${{ always() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      REPO: ${{ github.repository }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      RB_ID: ${{ needs.resolve.outputs.rollback-deployment-id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Registrar resultado del rollback
+        run: |
+          set -uo pipefail
+          state=failure
+          if [ "$(jq -r '[to_entries[] | select(.key != "resolve") | .value.result] | map(select(. == "failure" or . == "cancelled")) | length' <<< "$RESULTS")" = "0" ] \
+             && [ "$(jq -r '[to_entries[] | select(.key != "resolve") | .value.result] | map(select(. == "success")) | length' <<< "$RESULTS")" = "1" ]; then
+            state=success
+          fi
+          gh api -X POST "repos/$REPO/deployments/$RB_ID/statuses" -f state="$state" \
+            -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          echo "Resultado del rollback: $state"
