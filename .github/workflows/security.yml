@@ -81,22 +81,45 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Elegir modo de build CodeQL
+        id: mode
+        env:
+          LANGS: ${{ inputs.codeql-languages }}
+          BUILD_CMD: ${{ inputs.codeql-build-command }}
+        run: |
+          set -euo pipefail
+          # Con comando explícito: manual. Lenguajes interpretados (JS/TS, Python, Ruby, Actions): none
+          # (CodeQL rechaza autobuild para JS/TS). Cualquier lenguaje compilado: autobuild.
+          mode=none
+          if [ -n "${BUILD_CMD}" ]; then
+            mode=manual
+          else
+            IFS=',' read -ra arr <<< "${LANGS}"
+            for l in "${arr[@]}"; do
+              l="$(echo "$l" | xargs)"
+              case "$l" in
+                javascript-typescript|javascript|typescript|python|ruby|actions) ;;
+                *) mode=autobuild ;;
+              esac
+            done
+          fi
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
       - name: Inicializar CodeQL
         uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         env:
           CODEQL_LANGUAGES: ${{ inputs.codeql-languages }}
-          CODEQL_BUILD_MODE: ${{ inputs.codeql-build-command != '' && 'manual' || 'autobuild' }}
         with:
           languages: ${{ env.CODEQL_LANGUAGES }}
           queries: security-extended
-          build-mode: ${{ env.CODEQL_BUILD_MODE }}
+          build-mode: ${{ steps.mode.outputs.mode }}
 
       - name: Autobuild
-        if: inputs.codeql-build-command == ''
+        if: steps.mode.outputs.mode == 'autobuild'
         uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
 
       - name: Build manual
-        if: inputs.codeql-build-command != ''
+        if: steps.mode.outputs.mode == 'manual'
         env:
           BUILD_CMD: ${{ inputs.codeql-build-command }}
         run: bash -c "$BUILD_CMD"
