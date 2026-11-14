@@ -28,7 +28,7 @@ on:
         type: string
         required: true
       tool-repository:
-        description: "Repo que contiene bots/autodoc (p. ej. <org>-platform/bots)"
+        description: "Repo que contiene bots/autodoc (p. ej. xa-devsecops-office/xa-devsecops-platform-bots)"
         type: string
         required: true
       tool-ref:

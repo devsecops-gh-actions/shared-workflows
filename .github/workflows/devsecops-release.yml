@@ -25,7 +25,7 @@ on:
   workflow_call:
     inputs:
       tool-repository:
-        description: "Repo que contiene bots/release (p. ej. <org>-platform/bots)"
+        description: "Repo que contiene bots/release (p. ej. xa-devsecops-office/xa-devsecops-platform-bots)"
         type: string
         required: true
       tool-ref:

@@ -1,7 +1,7 @@
 # Workflow reutilizable: Genesys Cloud (flows y objects) para low-code.
 # Equivalente a Pipeline_Genesys_flows / Genesys_flows.groovy, Pipeline_Genesys_objects / Genesys_objects.groovy,
 # genesys_validate.groovy y genesys_restore.groovy de la librería Jenkins.
-# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/genesys.yml
+# Ubicación prevista en el repo de plataforma: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/genesys.yml
 # Ver README.md de esta carpeta.
 #
 # Modelo de entornos (Genesys solo tiene org PRE y org PRO; no hay org dev en la librería):

@@ -1,7 +1,7 @@
 # Workflow reutilizable: Sisnet (objetos/paquetes de la API Studio) para low-code.
 # Equivalente a Pipeline_Sisnet / Sisnet_{develop,feature,release,hotfix}.groovy y sisnet_calls.groovy
 # de la librería Jenkins (checks, backup, deploy, rollback por API).
-# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/sisnet.yml
+# Ubicación prevista en el repo de plataforma: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/sisnet.yml
 # Ver README.md de esta carpeta.
 #
 # Entornos: NO son fijos. El caller pasa environment-chain: lista JSON ordenada de objetos

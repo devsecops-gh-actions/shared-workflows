@@ -42,7 +42,7 @@ on:
         required: false
         default: ''
       security-config-repository:
-        description: 'Repo que contiene security/exceptions.yml y security/scripts/gen-ignores.mjs, p. ej. <org>-platform/security-config. Vacío = sin excepciones (fail-closed).'
+        description: 'Repo que contiene security/exceptions.yml y security/scripts/gen-ignores.mjs. Vacío = sin excepciones (fail-closed).'
         type: string
         required: false
         default: ''

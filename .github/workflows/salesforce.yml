@@ -1,7 +1,7 @@
 # Workflow reutilizable: Salesforce (Apex y metadatos) para low-code.
 # Equivalente a Pipeline_Salesforce / Salesforce_{develop,feature,release}.groovy y a
 # buildSalesforce.groovy / code_analyzer.groovy de la librería Jenkins.
-# Ubicación prevista en el repo de plataforma: <org>-platform/shared-workflows/.github/workflows/salesforce.yml
+# Ubicación prevista en el repo de plataforma: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/salesforce.yml
 # Ver README.md de esta carpeta.
 #
 # Entornos: NO son fijos. El caller pasa environment-chain (lista JSON ordenada de nombres de entorno GitHub).

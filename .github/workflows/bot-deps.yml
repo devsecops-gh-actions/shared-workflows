@@ -10,10 +10,8 @@
 #             con marcador <!-- devsecops-deps --> y, solo si todo se cumple, activa auto-merge
 #             con squash fijado al SHA evaluado. Nunca aprueba ni salta revisiones requeridas.
 #
-# Referencia a ci-<stack>.yml (jobs build-*): GitHub no admite expresiones en uses:, así que no hay
-# input "shared-workflow-ref". Antes de activar, sustituir en los seis jobs build-* las dos partes
-# marcadas: <org>-platform/shared-workflows (repo) y <sha-completo> (SHA del commit de ese repo).
-# Ver la tabla de prerrequisitos en README.md.
+# Referencia a ci-<stack>.yml (jobs build-*): GitHub no admite expresiones en uses:, así que cada job
+# fija el repo y el SHA de shared-workflows (commit de main al preparar esta PR). Ver README.md.
 #
 # Seguridad: el código del PR no se descarga ni se ejecuta en ningún job. La metadata y la lista
 # de ficheros vienen de la API. Los jobs de build usan el GITHUB_TOKEN de solo lectura del PR de
@@ -57,7 +55,7 @@ on:
         type: string
         required: false
       tool-repository:
-        description: "Repo que contiene bots/deps (p. ej. <org>-platform/devsecops-github-enterprise)"
+        description: "Repo que contiene bots/deps (p. ej. xa-devsecops-office/xa-devsecops-platform-bots)"
         type: string
         required: true
       tool-ref:
@@ -190,7 +188,7 @@ jobs:
     if: needs.guard.outputs.build == 'true' && inputs.stack == 'node'
     permissions:
       contents: read
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-node.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-node.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
@@ -203,7 +201,7 @@ jobs:
     if: needs.guard.outputs.build == 'true' && inputs.stack == 'java'
     permissions:
       contents: read
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-java.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-java.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
@@ -216,7 +214,7 @@ jobs:
     if: needs.guard.outputs.build == 'true' && inputs.stack == 'dotnet'
     permissions:
       contents: read
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-dotnet.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-dotnet.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
@@ -229,7 +227,7 @@ jobs:
     if: needs.guard.outputs.build == 'true' && inputs.stack == 'python'
     permissions:
       contents: read
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-python.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-python.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
@@ -242,7 +240,7 @@ jobs:
     if: needs.guard.outputs.build == 'true' && inputs.stack == 'go'
     permissions:
       contents: read
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-go.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-go.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
@@ -256,7 +254,7 @@ jobs:
     permissions:
       contents: read
       packages: write   # exigido por ci-docker.yml; el caller debe conceder también packages: write
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-docker.yml@<sha-completo>
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-docker.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae
     with:
       working-directory: ${{ inputs.working-directory }}
       kind: ${{ inputs.kind }}
