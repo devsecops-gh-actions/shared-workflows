@@ -1,0 +1,45 @@
+# CI del propio repo (pull_request): tests de bots/exceptions y lint de los workflows.
+# Acciones fijadas por SHA (el comentario indica la versión).
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bots-tests:
+    name: Tests bots/exceptions (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: node --test
+        run: >
+          node --test
+          bots/exceptions/scripts/command.test.mjs
+          bots/exceptions/scripts/exceptions.test.mjs
+          bots/exceptions/scripts/open-pr.test.mjs
+
+  actionlint:
+    name: actionlint (.github/workflows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint
+        uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
