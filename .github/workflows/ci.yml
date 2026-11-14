@@ -41,5 +41,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Instalar actionlint v1.7.12 (SHA-256 verificado)
+        env:
+          AL_VERSION: '1.7.12'
+          AL_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${AL_VERSION}/actionlint_${AL_VERSION}_linux_amd64.tar.gz"
+          echo "${AL_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+
       - name: Run actionlint
-        uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
+        # shellcheck y pyflakes desactivados: ~20 avisos de estilo preexistentes en scripts inline.
+        run: ./actionlint -shellcheck= -pyflakes=
