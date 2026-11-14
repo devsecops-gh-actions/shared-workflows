@@ -5,7 +5,6 @@
 #        -> publish (registro real, environment prod con aprobacion, lo gestiona publish-package.yml).
 # Fase siguiente (no incluida): deploy-* (pipelines/deploy/). Ver README, seccion "Release".
 # Ejemplo: libreria Node.js publicada en npm. Para otro stack, cambiar CI (ci-<stack>.yml) y registry.
-# Sustituir <SHA-DEL-RELEASE> por el SHA del tag de shared-workflows (p. ej. v1.0.0).
 name: Release
 
 on:
@@ -17,7 +16,7 @@ permissions:
 
 jobs:
   CI:
-    uses: <org>-platform/shared-workflows/.github/workflows/ci-node.yml@<SHA-DEL-RELEASE> # v1.0.0
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/ci-node.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae # main
     with:
       kind: library
       publish: true
@@ -27,7 +26,7 @@ jobs:
 
   supply-chain:
     needs: [CI]
-    uses: <org>-platform/shared-workflows/.github/workflows/supply-chain.yml@<SHA-DEL-RELEASE> # v1.0.0
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/supply-chain.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae # main
     with:
       artifact-name: ${{ needs.CI.outputs.artifact-name }}
       artifact-path: ${{ needs.CI.outputs.artifact-path }}
@@ -40,7 +39,7 @@ jobs:
 
   publish-dry-run:
     needs: [CI]
-    uses: <org>-platform/shared-workflows/.github/workflows/publish-package.yml@<SHA-DEL-RELEASE> # v1.0.0
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/publish-package.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae # main
     with:
       registry: npm
       version: ${{ needs.CI.outputs.version }}
@@ -52,7 +51,7 @@ jobs:
 
   publish:
     needs: [CI, supply-chain, publish-dry-run]
-    uses: <org>-platform/shared-workflows/.github/workflows/publish-package.yml@<SHA-DEL-RELEASE> # v1.0.0
+    uses: xa-devsecops-office/xa-devsecops-platform-shared-workflows/.github/workflows/publish-package.yml@bb94195f0e8e0b60bc5420d676dfacdb528427ae # main
     with:
       registry: npm
       version: ${{ needs.CI.outputs.version }}

@@ -1,0 +1,56 @@
+# CI del propio repo (pull_request): tests de bots/exceptions y lint de los workflows.
+# Acciones fijadas por SHA (el comentario indica la versión).
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bots-tests:
+    name: Tests bots/exceptions (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: node --test
+        run: >
+          node --test
+          bots/exceptions/scripts/command.test.mjs
+          bots/exceptions/scripts/exceptions.test.mjs
+          bots/exceptions/scripts/open-pr.test.mjs
+
+  actionlint:
+    name: actionlint (.github/workflows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Instalar actionlint v1.7.12 (SHA-256 verificado)
+        env:
+          AL_VERSION: '1.7.12'
+          AL_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${AL_VERSION}/actionlint_${AL_VERSION}_linux_amd64.tar.gz"
+          echo "${AL_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+
+      - name: Run actionlint
+        # shellcheck y pyflakes desactivados: ~20 avisos de estilo preexistentes en scripts inline.
+        run: ./actionlint -shellcheck= -pyflakes=

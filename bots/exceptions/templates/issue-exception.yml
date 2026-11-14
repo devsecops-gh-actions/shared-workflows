@@ -1,0 +1,99 @@
+# Issue form para solicitar una excepción de seguridad (F-c, W1).
+# Ubicación en este repo: bots/exceptions/templates/. GitHub solo lee formularios de
+# .github/ISSUE_TEMPLATE/ del repo de plataforma: copiar este fichero allí (ver ../README.md).
+#
+# El issue no añade nada al registro. El PR que lo implementa (rama bot/exceptions/* o feature/*)
+# sí, y necesita aprobación de CODEOWNERS de AppSec.
+name: Excepción de seguridad
+description: Solicitar una excepción para un hallazgo de un check de seguridad (máximo 90 días).
+title: "[excepción] "
+labels: ["security-exception"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Una excepción es la última opción. Antes se corrige, se actualiza la dependencia o se marca el falso positivo con evidencia.
+        No se piden excepciones para secretos reales: el secreto se revoca y se rota (security/docs/secret-response.md).
+        Proceso completo: security/exceptions.md.
+
+  - type: input
+    id: id
+    attributes:
+      label: id
+      description: CVE, ID de check de Checkov, ID de regla de CodeQL (p. ej. js/sql-injection) o fingerprint de gitleaks.
+      placeholder: CVE-2026-0000
+    validations:
+      required: true
+
+  - type: input
+    id: scope
+    attributes:
+      label: scope
+      description: Repo afectado en formato owner/repo. Varios repos separados por coma. No se admite "todos".
+      placeholder: acme-payments/billing-api
+    validations:
+      required: true
+
+  - type: dropdown
+    id: control
+    attributes:
+      label: control
+      description: Check al que afecta la excepción.
+      options:
+        - iac
+        - codeql
+        - dependencies
+        - containers
+        - secrets
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: owner
+      description: Responsable técnico que responde del hallazgo (usuario o nombre.apellido).
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: reason
+      description: Motivo y mitigación aplicada. Una línea de texto; sin credenciales ni tokens.
+    validations:
+      required: true
+
+  - type: input
+    id: approved_by
+    attributes:
+      label: approved_by
+      description: Aprobador de AppSec. La aprobación real se da en el PR (CODEOWNERS), no aquí.
+    validations:
+      required: true
+
+  - type: input
+    id: created
+    attributes:
+      label: created
+      description: Fecha de alta en formato AAAA-MM-DD.
+      placeholder: "2026-11-14"
+    validations:
+      required: true
+
+  - type: input
+    id: expires
+    attributes:
+      label: expires
+      description: "Fecha de caducidad en formato AAAA-MM-DD. Máximo 90 días después de created; el registro rechaza fechas posteriores. Una excepción caducada vuelve a bloquear el control."
+      placeholder: "2027-02-12"
+    validations:
+      required: true
+
+  - type: input
+    id: ticket
+    attributes:
+      label: ticket
+      description: Referencia al ticket de seguimiento (p. ej. JIRA-1234).
+    validations:
+      required: true

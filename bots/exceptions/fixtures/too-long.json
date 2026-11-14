@@ -1,0 +1,11 @@
+{
+  "id": "CKV_AWS_18",
+  "scope": "acme/infra",
+  "control": "iac",
+  "owner": "luis.perez",
+  "reason": "Caso límite: 91 días",
+  "approved_by": "appsec-lead",
+  "created": "2026-11-13",
+  "expires": "2027-02-12",
+  "ticket": "JIRA-5002"
+}

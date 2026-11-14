@@ -1,0 +1,45 @@
+# Composite action que emite el reporte de error fijo (4 líneas) para los workflows de pipelines/.
+#
+# Se referencia por SHA desde los workflows reutilizables, igual que el resto de `uses:`:
+#   uses: <org>-platform/xa-devsecops-platform-shared-workflows/pipelines/common/report-action@<sha-completo>
+#
+# No usa checkout ni token extra: el código va en el mismo repo de plataforma que el workflow.
+# Lógica en pipelines/common/report.sh. No hace exit: el paso que llama decide si falla.
+name: DevSecOps report
+description: Emite un error con código estable y las cuatro líneas fijas (Qué pasó, Por qué, Qué hacer, Ayuda).
+
+inputs:
+  code:
+    description: Código estable del error, p. ej. VAL-001 (ver docs/errores.md).
+    required: true
+  que-paso:
+    description: Qué pasó, en una frase fija y sin datos sensibles.
+    required: true
+  que-hacer:
+    description: Qué hacer para arreglarlo.
+    required: true
+  ayuda:
+    description: Enlace o ruta de ayuda.
+    required: false
+    default: docs/errores.md
+  por-que:
+    description: Por qué ocurre.
+    required: false
+    default: Ver "Qué pasó".
+
+runs:
+  using: composite
+  steps:
+    - name: Emitir reporte
+      shell: bash
+      env:
+        RPT_CODE: ${{ inputs.code }}
+        RPT_QUE: ${{ inputs.que-paso }}
+        RPT_HACER: ${{ inputs.que-hacer }}
+        RPT_AYUDA: ${{ inputs.ayuda }}
+        RPT_PORQUE: ${{ inputs.por-que }}
+        RPT_HELPER: ${{ github.action_path }}/../report.sh
+      run: |
+        # shellcheck source=/dev/null
+        . "$RPT_HELPER"
+        report_fail "$RPT_CODE" "$RPT_QUE" "$RPT_HACER" "$RPT_AYUDA" "$RPT_PORQUE"
