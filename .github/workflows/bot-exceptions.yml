@@ -1,0 +1,150 @@
+# workflow.yml (F-c, W2). Comando /security-exception en comentarios de pull request.
+# Plantilla: copiar a .github/workflows/ del repo de plataforma (ver ../README.md).
+#
+# Dos jobs:
+# - security-exception: valida el comando y autor, y responde en el PR. Sin escritura en el repo.
+# - open-exception-pr: solo si la decision es "accept". Abre un PR que añade la entrada a
+#   security/exceptions.yml, en una rama bot/exceptions/*. Solo con EXCEPTIONS_APPLY == 'SI'
+#   (variable de repositorio); si no, dry-run y lo indica en el comentario. Nunca fusiona.
+#
+# Seguridad:
+# - Hace checkout de la rama por defecto (sin ref): nunca ejecuta codigo del PR.
+# - Ignora PRs desde fork. El repositorio head se consulta a la API, no al payload del comentario.
+# - Autores permitidos: logins de la variable de repositorio APPSEC_MEMBERS (equipo de AppSec de CODEOWNERS).
+# - El comentario entra por variable de entorno, nunca interpolado dentro de un `run`.
+# - contents: write solo en open-exception-pr. La restriccion a ramas bot/exceptions/* se aplica en
+#   open-pr.mjs (los permisos de GITHUB_TOKEN no se pueden limitar por nombre de rama).
+# - Un PR creado con GITHUB_TOKEN no dispara workflows: sus checks no se ejecutan hasta que se
+#   use una App (ver docs/plan-2-funcionalidades.md, F-d).
+name: Excepciones de seguridad (comando)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  security-exception:
+    name: security-exception
+    if: >-
+      startsWith(github.event.comment.body, '/security-exception') &&
+      github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      head: ${{ steps.pr.outputs.head }}
+      today: ${{ steps.decide.outputs.today }}
+    steps:
+      - name: Checkout (rama por defecto)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Obtener repositorio head del PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.repo.full_name // ""')
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Decidir (validar comando y autor)
+        id: decide
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+          HEAD_REPO: ${{ steps.pr.outputs.head }}
+          BASE_REPO: ${{ github.repository }}
+          APPSEC_MEMBERS: ${{ vars.APPSEC_MEMBERS }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          echo "today=$today" >> "$GITHUB_OUTPUT"
+          TODAY="$today" node bots/exceptions/scripts/command.mjs > "$RUNNER_TEMP/decision.json"
+          jq -r '.message' "$RUNNER_TEMP/decision.json" > "$RUNNER_TEMP/message.md"
+          echo "action=$(jq -r '.action' "$RUNNER_TEMP/decision.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar rechazo en el PR
+        if: ${{ steps.decide.outputs.action == 'reject' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          MESSAGE_FILE: ${{ runner.temp }}/message.md
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$MESSAGE_FILE" >/dev/null
+
+      - name: Fallar si el comando no es valido
+        if: ${{ steps.decide.outputs.action == 'reject' }}
+        run: |
+          echo "::error::Comando /security-exception rechazado. Ver el comentario del PR."
+          exit 1
+
+  open-exception-pr:
+    name: open-exception-pr
+    needs: security-exception
+    if: ${{ needs.security-exception.outputs.action == 'accept' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout (rama por defecto)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configurar Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Abrir PR con la entrada (o dry-run)
+        id: open
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+          HEAD_REPO: ${{ needs.security-exception.outputs.head }}
+          BASE_REPO: ${{ github.repository }}
+          APPSEC_MEMBERS: ${{ vars.APPSEC_MEMBERS }}
+          TODAY: ${{ needs.security-exception.outputs.today }}
+          EXCEPTIONS_APPLY: ${{ vars.EXCEPTIONS_APPLY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node bots/exceptions/scripts/command.mjs > "$RUNNER_TEMP/decision.json"
+          jq -r '.message' "$RUNNER_TEMP/decision.json" > "$RUNNER_TEMP/message.md"
+          echo "action=$(jq -r '.action' "$RUNNER_TEMP/decision.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar resultado en el PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          MESSAGE_FILE: ${{ runner.temp }}/message.md
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$MESSAGE_FILE" >/dev/null
+
+      - name: Fallar si no se pudo abrir el PR
+        if: ${{ steps.open.outputs.action == 'reject' }}
+        run: |
+          echo "::error::No se pudo abrir el PR de la excepcion. Ver el comentario del PR."
+          exit 1

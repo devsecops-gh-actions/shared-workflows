@@ -1,0 +1,11 @@
+{
+  "id": "CVE-2025-9999",
+  "scope": "acme/api",
+  "control": "dependencies",
+  "owner": "ana.lopez",
+  "reason": "Fecha de caducidad ya pasada respecto a 2026-11-13",
+  "approved_by": "appsec-lead",
+  "created": "2026-01-01",
+  "expires": "2026-03-01",
+  "ticket": "JIRA-5003"
+}

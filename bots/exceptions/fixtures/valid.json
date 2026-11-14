@@ -1,0 +1,11 @@
+{
+  "id": "CVE-2026-4444",
+  "scope": "acme/api",
+  "control": "dependencies",
+  "owner": "ana.lopez",
+  "reason": "Sin parche upstream; mitigado con WAF y validación de entrada",
+  "approved_by": "appsec-lead",
+  "created": "2026-11-13",
+  "expires": "2027-02-11",
+  "ticket": "JIRA-5001"
+}
