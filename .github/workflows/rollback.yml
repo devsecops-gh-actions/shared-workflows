@@ -12,6 +12,86 @@
 name: rollback
 
 on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Entorno: dev, staging o prod."
+        required: true
+        type: string
+      target:
+        description: "Target a revertir: k8s, serverless, paas o vm-iac."
+        required: true
+        type: string
+      target-version:
+        description: "Versión concreta a la que volver. Vacío = la última versión exitosa anterior a la actual."
+        required: false
+        type: string
+        default: ""
+      dry-run:
+        description: "true: solo escribe en el resumen qué versión revertiría a cuál. false: ejecuta el rollback."
+        required: false
+        type: boolean
+        default: true
+      reason:
+        description: "Motivo del rollback (obligatorio en prod)."
+        required: false
+        type: string
+        default: ""
+      health-check-url:
+        description: "URL de comprobación (obligatoria salvo vm-iac)."
+        required: false
+        type: string
+        default: ""
+      rollback-on-failure:
+        description: "Revertir de nuevo si la comprobación del rollback falla."
+        required: false
+        type: boolean
+        default: false
+      app-name:
+        description: "k8s/serverless: nombre de la aplicación."
+        required: false
+        type: string
+        default: ""
+      cloud:
+        description: "k8s: aks, eks o gke. vm-iac: azure o aws."
+        required: false
+        type: string
+        default: ""
+      tool:
+        description: "k8s: helm o kubectl."
+        required: false
+        type: string
+        default: helm
+      platform:
+        description: "paas: azure-app-service o cloud-run."
+        required: false
+        type: string
+        default: ""
+      chart-path:
+        description: "k8s: ruta del chart."
+        required: false
+        type: string
+        default: charts/app
+      values-dir:
+        description: "k8s: directorio de values por entorno."
+        required: false
+        type: string
+        default: deploy/values
+      manifests-path:
+        description: "k8s con tool=kubectl: directorio de manifiestos."
+        required: false
+        type: string
+        default: k8s
+      iac-path:
+        description: "vm-iac: directorio raíz de Terraform."
+        required: false
+        type: string
+        default: infra/terraform
+      runner:
+        description: 'Runner en JSON (por defecto "ubuntu-latest").'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
   workflow_dispatch:
     inputs:
       environment:
@@ -29,6 +109,11 @@ on:
         required: false
         type: string
         default: ""
+      dry-run:
+        description: "true (defecto en staging y prod; el dispatch no puede variar el defecto por entorno): solo escribe en el resumen qué versión revertiría a cuál, sin registrar deployments ni desplegar. false: ejecuta el rollback."
+        required: false
+        type: boolean
+        default: true
       reason:
         description: "Motivo del rollback (obligatorio en prod)."
         required: false
@@ -117,6 +202,8 @@ jobs:
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       GH_TOKEN: ${{ github.token }}
       GH_ACTOR: ${{ github.actor }}
+      DRY_RUN: ${{ inputs.dry-run }}
+      CALLER_REF: ${{ github.ref }}
     steps:
       - name: Validar entradas
         run: |
@@ -125,6 +212,9 @@ jobs:
           case "$ENVIRONMENT" in dev|staging|prod) ;; *) echo "::error::environment no válido"; exit 1 ;; esac
           if [ "$ENVIRONMENT" = "prod" ] && [ -z "$REASON" ]; then
             echo "::error::el rollback en prod requiere reason"; exit 1
+          fi
+          if [ "$ENVIRONMENT" = "prod" ] && [[ "$CALLER_REF" != refs/heads/hotfix/* ]]; then
+            echo "::error::rollback a prod solo desde ramas hotfix/* (ref: $CALLER_REF)"; exit 1
           fi
           if [ "$TARGET" != "vm-iac" ] && [ -z "$HEALTH_URL" ]; then
             echo "::error::health-check-url es obligatoria para $TARGET"; exit 1
@@ -160,10 +250,13 @@ jobs:
           payload=$(jq -cn --arg v "$chosen_v" --arg r "$chosen_ref" --arg t "$TARGET" --arg reason "$REASON" \
             --arg from "$current" --arg by "$GH_ACTOR" \
             '{version:$v, artifact_ref:$r, target:$t, rollback:true, rolled_back_from:$from, reason:$reason, requested_by:$by}')
-          rb_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg reason "$REASON" --argjson payload "$payload" \
-            '{ref:$sha, environment:$env, task:"rollback", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:("rollback: " + $reason)}' \
-            | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
-          gh api -X POST "repos/$REPO/deployments/$rb_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          rb_id=""
+          if [ "$DRY_RUN" != "true" ]; then
+            rb_id=$(jq -cn --arg env "$ENVIRONMENT" --arg sha "$GITHUB_SHA" --arg reason "$REASON" --argjson payload "$payload" \
+              '{ref:$sha, environment:$env, task:"rollback", auto_merge:false, required_contexts:[], transient_environment:false, production_environment:($env=="prod"), payload:$payload, description:("rollback: " + $reason)}' \
+              | gh api -X POST "repos/$REPO/deployments" --input - --jq '.id')
+            gh api -X POST "repos/$REPO/deployments/$rb_id/statuses" -f state=in_progress -f environment="$ENVIRONMENT" -f log_url="$RUN_URL" >/dev/null
+          fi
 
           {
             echo "version=$chosen_v"
@@ -173,6 +266,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Rollback $TARGET en $ENVIRONMENT"
+            if [ "$DRY_RUN" = "true" ]; then echo "> **Dry-run**: no se ha registrado ni desplegado nada. Para ejecutar, lanzar con dry-run=false."; fi
             echo "- Desde: \`$current\` hacia: \`$chosen_v\`"
             echo "- Artefacto: \`$chosen_ref\`"
             echo "- Motivo: $REASON"
@@ -181,7 +275,7 @@ jobs:
 
   rollback-k8s:
     needs: resolve
-    if: ${{ inputs.target == 'k8s' }}
+    if: ${{ !inputs.dry-run && inputs.target == 'k8s' }}
     uses: ./.github/workflows/deploy-k8s.yml
     with:
       environment: ${{ inputs.environment }}
@@ -206,7 +300,7 @@ jobs:
 
   rollback-serverless:
     needs: resolve
-    if: ${{ inputs.target == 'serverless' }}
+    if: ${{ !inputs.dry-run && inputs.target == 'serverless' }}
     uses: ./.github/workflows/deploy-serverless.yml
     with:
       environment: ${{ inputs.environment }}
@@ -226,7 +320,7 @@ jobs:
 
   rollback-paas:
     needs: resolve
-    if: ${{ inputs.target == 'paas' }}
+    if: ${{ !inputs.dry-run && inputs.target == 'paas' }}
     uses: ./.github/workflows/deploy-paas.yml
     with:
       environment: ${{ inputs.environment }}
@@ -246,7 +340,7 @@ jobs:
 
   rollback-vm-iac:
     needs: resolve
-    if: ${{ inputs.target == 'vm-iac' }}
+    if: ${{ !inputs.dry-run && inputs.target == 'vm-iac' }}
     uses: ./.github/workflows/deploy-vm-iac.yml
     with:
       environment: ${{ inputs.environment }}
@@ -266,7 +360,7 @@ jobs:
 
   finish:
     needs: [resolve, rollback-k8s, rollback-serverless, rollback-paas, rollback-vm-iac]
-    if: ${{ always() && needs.resolve.result == 'success' }}
+    if: ${{ !inputs.dry-run && always() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
